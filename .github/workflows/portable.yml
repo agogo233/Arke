@@ -1,6 +1,7 @@
-# Win x64 portable build. Builds the single portable exe from main (or by hand) and
-# uploads one flat zip as an artifact. Portable is Arke's headline distribution (README
-# "Install": a single exe, no runtime), so this build skips the Inno Setup installer.
+# Win x64 portable build. Builds the single portable exe from main (or by hand) and uploads
+# the four dist files as one artifact (GitHub zips them flat: one unzip gives the bundle, no
+# nested zip). Portable is Arke's headline distribution (README "Install": a single exe, no
+# runtime), so this build skips the Inno Setup installer.
 name: portable
 
 on:
@@ -98,39 +99,9 @@ jobs:
           if ($miss) { throw "dist incomplete: $($miss -join '; ')" }
           Write-Host "OK: portable package complete ($($all.Count) files, no installer)"
 
-      - name: zip the package (flat, no nesting) and verify entries
-        shell: pwsh
-        run: |
-          $zipPath = Join-Path $PWD 'arke-portable-x64.zip'
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          $distFiles = @(Get-ChildItem -Path dist -File)
-          Add-Type -AssemblyName System.IO.Compression
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
-          try {
-            foreach ($f in $distFiles) {
-              $entry  = $zip.CreateEntry($f.Name, [System.IO.Compression.CompressionLevel]::Optimal)
-              $stream = $entry.Open()
-              try { $f.OpenRead().CopyTo($stream) } finally { $stream.Dispose() }
-            }
-          } finally { $zip.Dispose() }
-          $zip2 = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-          try {
-            $entries = @($zip2.Entries | ForEach-Object { $_.FullName })
-            Write-Host "zip entries ($($entries.Count)):"
-            $entries | ForEach-Object { Write-Host "  $_" }
-            if ($entries.Count -ne $distFiles.Count) {
-              throw "zip has $($entries.Count) entries but dist has $($distFiles.Count) files"
-            }
-            foreach ($f in $distFiles) {
-              if ($entries -notcontains $f.Name) { throw "zip missing entry: $($f.Name)" }
-            }
-          } finally { $zip2.Dispose() }
-          Write-Host "OK: zip matches dist exactly ($($entries.Count) flat entries, no nesting)"
-
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: arke-portable-x64
-          path: arke-portable-x64.zip
+          path: dist
           if-no-files-found: error
           retention-days: 7
