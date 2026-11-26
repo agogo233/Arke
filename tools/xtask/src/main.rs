@@ -184,17 +184,27 @@ fn git(args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// `repo = "owner/name"` from `release.toml`: the GitHub repo that hosts releases.
-fn releases_repo() -> String {
+/// A setting from `release.toml` (`key = value`).
+fn release_setting(key: &str) -> Option<String> {
     std::fs::read_to_string(root().join("release.toml"))
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .find_map(|l| {
             let (k, v) = l.split_once('=')?;
-            (k.trim() == "repo").then(|| v.trim().trim_matches('"').to_string())
+            (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
         })
-        .unwrap_or_default()
+}
+
+/// `repo = "owner/name"` from `release.toml`: the GitHub repo that hosts releases.
+fn releases_repo() -> String {
+    release_setting("repo").unwrap_or_default()
+}
+
+/// `updates = true` from `release.toml`: whether built exes may check for updates. Off unless the
+/// file asks for it, so a build doesn't contact GitHub on its own.
+fn release_updates() -> bool {
+    release_setting("updates").is_some_and(|v| v == "true" || v == "1")
 }
 
 fn value_of(args: &[String], name: &str) -> Option<String> {
@@ -561,6 +571,7 @@ fn cmd_build(args: &[String]) -> Result<(String, Vec<PathBuf>)> {
     cmd_licenses()?;
     let commit = git(&["rev-parse", "--short=8", "HEAD"]).unwrap_or_default();
     let repo = releases_repo();
+    let updates = release_updates();
     println!("building Arke {version} ({channel})...");
     let arches = arches(args)?;
     let target_dir = root().join("target").join("dist");
@@ -576,6 +587,7 @@ fn cmd_build(args: &[String]) -> Result<(String, Vec<PathBuf>)> {
         .env("ARKE_CHANNEL", channel)
         .env("ARKE_COMMIT", &commit)
         .env("ARKE_RELEASES_REPO", &repo)
+        .env("ARKE_UPDATES", if updates { "1" } else { "0" })
         .current_dir(root())
         .status()
         .with_context(|| format!("running {cargo} build"))?;
@@ -623,6 +635,9 @@ fn cmd_build(args: &[String]) -> Result<(String, Vec<PathBuf>)> {
         .with_context(|| format!("copying {LICENSES} to {}", dist.display()))?;
     if repo.is_empty() {
         println!("(release.toml has no repo set: this build won't check for updates)");
+    }
+    if !updates {
+        println!("(release.toml has updates off: this build won't check for updates)");
     }
     Ok((version, packaged))
 }

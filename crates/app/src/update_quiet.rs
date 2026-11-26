@@ -657,7 +657,9 @@ pub(crate) struct RealHost;
 
 impl Host for RealHost {
     fn can_update(&self) -> bool {
-        !build_info::RELEASES_REPO.is_empty() && update::package_manager().is_none()
+        build_info::UPDATES_ENABLED
+            && !build_info::RELEASES_REPO.is_empty()
+            && update::package_manager().is_none()
     }
 
     fn download(&self, release: Release, stop: Arc<AtomicBool>, tx: flume::Sender<Report>) {

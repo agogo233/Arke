@@ -246,6 +246,9 @@ fn pick_for(json: &str, channel: Channel, current: &Version, suffix: &str) -> Op
 
 /// Check once (background thread): `Ok(None)` means up to date.
 pub(crate) fn check(channel: Channel) -> Result<Option<Release>, UpdateError> {
+    if !build_info::UPDATES_ENABLED {
+        return Err(UpdateError::NoSource);
+    }
     let repo = build_info::RELEASES_REPO;
     if repo.is_empty() {
         return Err(UpdateError::NoSource);
@@ -397,6 +400,9 @@ pub(crate) fn download_to(
     release: &Release,
     progress: &mut dyn FnMut(u64, Option<u64>) -> bool,
 ) -> Result<PathBuf, UpdateError> {
+    if !build_info::UPDATES_ENABLED {
+        return Err(UpdateError::NoSource);
+    }
     std::fs::create_dir_all(dir)?;
     let target = dir.join(&release.exe_name);
     let part = target.with_extension("part");
@@ -718,6 +724,9 @@ impl UpdateState {
 
 /// Check for updates in the background; results go to [`UpdateState`].
 pub(crate) fn start_check(channel: Channel, cx: &mut App) {
+    if !build_info::UPDATES_ENABLED {
+        return;
+    }
     if matches!(
         UpdateState::get(cx),
         UpdateState::Checking | UpdateState::Downloading(..)
@@ -987,7 +996,10 @@ pub(crate) fn channel_changed(channel: Channel, cx: &mut App) {
         .read(cx)
         .settings
         .update_auto;
-    let can_check = auto && !build_info::RELEASES_REPO.is_empty() && package_manager().is_none();
+    let can_check = auto
+        && build_info::UPDATES_ENABLED
+        && !build_info::RELEASES_REPO.is_empty()
+        && package_manager().is_none();
     // A background download the new channel doesn't offer is dropped; one it does stays.
     if crate::update_quiet::channel_changed(channel, cx) {
         if can_check {
@@ -1010,7 +1022,10 @@ pub(crate) fn auto_check(cx: &mut App) {
         .read(cx)
         .settings
         .clone();
-    if !settings.update_auto || build_info::RELEASES_REPO.is_empty() || package_manager().is_some()
+    if !settings.update_auto
+        || !build_info::UPDATES_ENABLED
+        || build_info::RELEASES_REPO.is_empty()
+        || package_manager().is_some()
     {
         return;
     }

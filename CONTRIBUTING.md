@@ -112,3 +112,6 @@ that step; commit the file when dependencies change.
 ARM64 needs the MSVC ARM64 build tools; `--arch x64` builds only x64. `cargo xtask publish <channel>` uploads to the repo in
 `release.toml` and needs `GITHUB_TOKEN`; with `--prebuilt` it uploads what is already in `dist/`
 instead of building.
+
+`release.toml` has an `updates` key too: `updates = false` (the default) builds exes that never
+check for updates and never contact GitHub; `updates = true` lets them check the repo above.

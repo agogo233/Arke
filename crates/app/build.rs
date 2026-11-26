@@ -7,6 +7,8 @@
 //!   - `ARKE_CHANNEL`: `stable`, `rc`, `nightly`; defaults to `dev`
 //!   - `ARKE_COMMIT`: short commit hash; defaults to asking git
 //!   - `ARKE_RELEASES_REPO`: GitHub repo with releases (`owner/name`); empty disables update checks
+//!   - `ARKE_UPDATES`: `1` or `true` lets this build check for updates; unset (the default) keeps
+//!     it from contacting GitHub at all
 //! - Icon and file version info (`arke.rc` template). The icon is generated from SVG by
 //!   `cargo run -p genicon`.
 
@@ -23,6 +25,16 @@ fn env_or(name: &str, default: impl FnOnce() -> String) -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(default)
+}
+
+/// Whether an env var asks for something: `1` or `true` say yes, anything else (unset included)
+/// says no.
+fn env_flag(name: &str) -> bool {
+    println!("cargo:rerun-if-env-changed={name}");
+    std::env::var(name).is_ok_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
 }
 
 fn git_commit() -> String {
@@ -79,10 +91,16 @@ fn main() {
     let channel = env_or("ARKE_CHANNEL", || "dev".into());
     let commit = env_or("ARKE_COMMIT", git_commit);
     let repo = env_or("ARKE_RELEASES_REPO", String::new);
+    let updates = env_flag("ARKE_UPDATES");
     println!("cargo:rustc-env=ARKE_VERSION={version}");
     println!("cargo:rustc-env=ARKE_CHANNEL={channel}");
     println!("cargo:rustc-env=ARKE_COMMIT={commit}");
     println!("cargo:rustc-env=ARKE_RELEASES_REPO={repo}");
+    // Update checks are off unless the build asked for them.
+    println!("cargo::rustc-check-cfg=cfg(arke_updates_disabled)");
+    if !updates {
+        println!("cargo::rustc-cfg=arke_updates_disabled");
+    }
     // Rerun on a new commit so dev builds don't show a stale hash.
     let git = manifest.join("../../.git");
     println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
