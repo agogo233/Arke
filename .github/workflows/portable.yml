@@ -40,18 +40,32 @@ jobs:
           # windows-latest ships Inno Setup 6.7.0-6.7.3; upstream 0.9.2's arke.iss now requires
           # 6.7.4+, so xtask would try (and fail) to build the installer. Portable-only wants the
           # installer skipped, so delete Inno Setup from the paths iscc() searches -> iscc() None.
-          $paths = @(
-            "$env:ProgramFiles(x86)\Inno Setup 6",
-            "$env:ProgramFiles\Inno Setup 6",
-            "$env:LOCALAPPDATA\Programs\Inno Setup 6"
+          # Resolve env vars via [Environment]::GetEnvironmentVariable: the ProgramFiles(x86) name
+          # has a space before "(x86)", which "$env:ProgramFiles(x86)" interpolation would drop
+          # (it parses as $env:ProgramFiles + literal "(x86)").
+          $bases = @(
+            [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'),
+            [Environment]::GetEnvironmentVariable('ProgramFiles'),
+            [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
           )
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              Write-Host "removing $p"
-              Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
-            }
+          $dirs = @()
+          foreach ($b in $bases) {
+            if (-not $b) { continue }
+            if ($b -like '*Local') { $b = Join-Path $b 'Programs' }
+            $dir = Join-Path $b 'Inno Setup 6'
+            if (Test-Path $dir) { $dirs += $dir }
           }
-          $left = @("$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ }
+          foreach ($d in $dirs) {
+            Write-Host "removing $d"
+            Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $left = @()
+          foreach ($b in $bases) {
+            if (-not $b) { continue }
+            if ($b -like '*Local') { $b = Join-Path $b 'Programs' }
+            $exe = Join-Path $b 'Inno Setup 6\ISCC.exe'
+            if (Test-Path $exe) { $left += $exe }
+          }
           if ($left) { throw "Inno Setup still present: $($left -join ', ')" }
           Write-Host "OK: Inno Setup removed; xtask will skip the installer (portable-only)"
 
