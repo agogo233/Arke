@@ -34,11 +34,32 @@ jobs:
         with:
           tool: cargo-about
 
+      - name: remove preinstalled Inno Setup (skip installer, portable-only)
+        shell: pwsh
+        run: |
+          # windows-latest ships Inno Setup 6.7.0-6.7.3; upstream 0.9.2's arke.iss now requires
+          # 6.7.4+, so xtask would try (and fail) to build the installer. Portable-only wants the
+          # installer skipped, so delete Inno Setup from the paths iscc() searches -> iscc() None.
+          $paths = @(
+            "$env:ProgramFiles(x86)\Inno Setup 6",
+            "$env:ProgramFiles\Inno Setup 6",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Write-Host "removing $p"
+              Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $left = @("$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ }
+          if ($left) { throw "Inno Setup still present: $($left -join ', ')" }
+          Write-Host "OK: Inno Setup removed; xtask will skip the installer (portable-only)"
+
       - name: build portable (x64)
         shell: bash
         run: |
-          # nightly channel: version = <next>-nightly.YYYYMMDD. No Inno Setup on the runner and
-          # ARKE_REQUIRE_SETUP unset, so xtask skips the installer and ships the portable exe only.
+          # nightly channel: version = <next>-nightly.YYYYMMDD. ARKE_REQUIRE_SETUP unset and Inno
+          # Setup removed above, so iscc() returns None and xtask skips the installer: portable exe only.
           cargo xtask build nightly --arch x64
           ls -l dist
 
