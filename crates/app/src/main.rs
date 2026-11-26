@@ -12,12 +12,16 @@
 //!                               and `docs/integration.md`)
 //!   arke --home                 what Win+E runs while "Open folders in Arke" is on: opens a window
 //!                               like starting Arke (Settings › "New windows open to")
+//!   arke --search <text>        a new window searching the whole computer for <text>
 //!   arke --restore-explorer     undo the folder handler registration and turn the setting off
 //!   arke --uninstall [--keep-settings] [--quiet] [--dry-run]
 //!                               remove Arke from this PC (see `uninstall.rs`)
 //!   arke --shell-host           (internal) hidden context menu process, see `shell_host.rs`
 //!   arke --thumb-host           (internal) hidden video thumbnail process, see `thumb_host.rs`
 //!   arke --pick-file            (internal) one file dialog for Settings, see `win_picker.rs`
+//!   arke -Embedding             (internal) COM starts Arke for the folder verbs, see
+//!                               `win_folder_com.rs`
+//!   arke --com-check            (internal) whether COM reaches that class
 //!
 //! By default the first Arke stays in the background after its last window closes, so later
 //! launches only open a window without reinitializing the GPU. See `instance.rs`.
@@ -41,6 +45,7 @@ mod plural;
 
 mod a11y;
 mod api;
+mod archive_password;
 mod assets;
 mod bench;
 mod bench_index;
@@ -57,7 +62,11 @@ mod frame_probe;
 mod global_search;
 mod home;
 mod instance;
+mod keynav;
+mod localized;
 mod media;
+mod menu_order;
+mod menu_pin_looks;
 mod motion;
 mod net_dialog;
 mod op_center;
@@ -71,6 +80,7 @@ mod properties;
 mod quick_access;
 mod quicklook;
 mod recycle_bin;
+mod redirection_guard;
 mod remote_shell;
 mod resident;
 mod saved_workspaces;
@@ -91,15 +101,22 @@ mod tray;
 mod uninstall;
 mod update;
 mod update_quiet;
+mod update_route;
+mod update_sig;
 mod whats_new;
 mod win;
+mod win_bin_evict;
+mod win_bin_usage;
 mod win_cloud;
 mod win_devnotify;
 mod win_dragimage;
 mod win_e_hook;
 mod win_eject;
+mod win_fast_copy;
 mod win_fast_recycle;
 mod win_fileops;
+mod win_folder_com;
+mod win_folder_visit;
 mod win_http;
 mod win_icons;
 mod win_inuse;
@@ -172,10 +189,27 @@ struct Args {
     restore_explorer: bool,
     /// A window of its own, not a tab in the window used last (`--new-window`)
     new_window: bool,
+    /// Search the whole computer for this text in the window that opens (`--search <text>`)
+    search: Option<String>,
+    /// Started by COM for the folder verbs (`-Embedding`, `win_folder_com.rs`): like
+    /// `--background`, and when another Arke is resident, pass the calls on to it
+    embedding: bool,
 }
 
 fn parse_args() -> Args {
     parse_args_from(std::env::args_os().skip(1))
+}
+
+/// The command line as text, for reading flags (`--indexd`, `--uninstall`, `--api`, the update
+/// hand-off). `std::env::args` panics on an argument that isn't valid Unicode, such as a folder
+/// whose name has a lone surrogate; here such an argument keeps U+FFFD in its place. The folder
+/// argument itself is read as an `OsString` ([`parse_args`]).
+fn text_args() -> Vec<String> {
+    text_args_from(std::env::args_os())
+}
+
+fn text_args_from(it: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    it.map(|arg| arg.to_string_lossy().into_owned()).collect()
 }
 
 fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
@@ -189,6 +223,8 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
         page: None,
         restore_explorer: false,
         new_window: false,
+        search: None,
+        embedding: false,
     };
     while let Some(arg) = it.next() {
         match arg.to_str() {
@@ -209,12 +245,23 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
             Some("--home") => {}
             Some("--restore-explorer") => args.restore_explorer = true,
             Some(NEW_WINDOW_ARG) => args.new_window = true,
+            // Text to search for; a missing or empty one is ignored.
+            Some("--search") => {
+                args.search = it
+                    .next()
+                    .and_then(|text| text.into_string().ok())
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty());
+            }
+            // Started again without RedirectionGuard (`redirection_guard.rs`): nothing to do.
+            Some(redirection_guard::RELAUNCHED_ARG) => {}
             // Just updated: the old process's pid follows (already waited for at the start of
             // app_main).
             Some(update::AFTER_UPDATE_ARG) => {
                 let _ = it.next();
                 update::mark_just_updated();
             }
+            Some(flag) if win_folder_com::is_embedding_arg(flag) => args.embedding = true,
             // An empty argument (`arke.exe ""`, a shortcut with an empty %1) names no folder.
             _ if arg.is_empty() => {}
             _ => args.path = Some(path_arg(&arg)),
@@ -272,7 +319,7 @@ fn instant_from_unix_ms(launched_unix_ms: u64) -> Instant {
 const INDEXD_ARG: &str = "--indexd";
 
 fn main() -> std::process::ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let args = text_args();
     if args.get(1).map(String::as_str) == Some(INDEXD_ARG) {
         return arke_indexd::cli::run(args[2..].to_vec(), Some(INDEXD_ARG));
     }
@@ -307,6 +354,10 @@ fn main() -> std::process::ExitCode {
     if args.get(1).map(String::as_str) == Some(win_picker::PICK_ARG) {
         win_picker::run();
         return std::process::ExitCode::SUCCESS;
+    }
+    // Whether the shell would reach Arke's folder-open COM class (`win_folder_com.rs`).
+    if args.get(1).map(String::as_str) == Some(win_folder_com::CHECK_ARG) {
+        return win_folder_com::check_cli();
     }
     let mut args = parse_args();
     // As the folder handler the shell hands over every folder, virtual ones included: what Arke
@@ -361,7 +412,7 @@ fn app_main(mut args: Args) {
         return;
     }
     // Launched by the old version (auto-update): wait for it to exit before taking over residency.
-    update::wait_for_previous(&std::env::args().collect::<Vec<_>>());
+    update::wait_for_previous(&text_args());
     let started_at = Instant::now();
     // A launch in the background opens no window; any it opens later is no cold start.
     if !args.background {
@@ -401,17 +452,33 @@ fn app_main(mut args: Args) {
         }
         return;
     }
+    // Started by Inno Setup with Windows' RedirectionGuard on (#406): start again through the
+    // desktop shell without it, and exit. Here, after the one-shot commands the installer waits for
+    // (`--quit` above, `--uninstall` in main), with the log open for why, and before this copy
+    // opens a window or takes over residency, which the new copy does instead. Not when COM started
+    // this copy (`-Embedding`): COM waits for this process to register its class, so a copy
+    // started elsewhere would leave the caller waiting.
+    if !args.embedding && redirection_guard::restart_unguarded() {
+        crashlog::flush(Duration::from_millis(200));
+        return;
+    }
     let linger = shell_window(&args);
-    let listener = if args.background {
+    let listener = if args.background || args.embedding {
         // Background launch: if a resident process exists we're not needed; otherwise become
-        // resident without a window.
+        // resident without a window. Started by COM, the folders come through the class.
         match instance::listen() {
             Some(listener) => Some(listener),
+            None if args.embedding => {
+                win_folder_com::forward_until_idle();
+                return;
+            }
             None => return,
         }
     } else if args.resident || args.quit {
         let request = if args.quit {
             Request::Quit
+        } else if let Some(text) = &args.search {
+            Request::Search(text.clone())
         } else {
             Request::Open(OpenRequest {
                 path: args.path.clone(),
@@ -442,13 +509,18 @@ fn app_main(mut args: Args) {
         return;
     }
 
-    let background = args.background;
+    let background = args.background || args.embedding;
     let bench = args
         .window_bench()
         .map(|mode| Bench::new(mode, args.bench_out));
     let start_path = args.path;
     let start_page = args.page;
+    let start_search = args.search;
     let resident = listener.is_some();
+    // The folder verbs may call the resident Arke over COM (#340).
+    if resident && bench.is_none() && folder_handler::shell_allowed() {
+        let _ = win_folder_com::serve();
+    }
     log::info!(
         "{}",
         if resident {
@@ -518,6 +590,7 @@ fn app_main(mut args: Args) {
             cx,
         );
         follow_language_setting(&store, cx);
+        follow_update_route(&store, cx);
         let remotes = remote_shell::start(&store, cx);
         let services = Services {
             fs: Arc::new(arke_remote::RoutingFs::new(
@@ -546,7 +619,7 @@ fn app_main(mut args: Args) {
         // The integration API (`api.rs`): `WM_COPYDATA` to any window, and the resident pipe.
         let api_queue = start_api(cx, &services);
         if bench.is_none() {
-            follow_drive_removals(cx);
+            follow_drive_removals(cx, Arc::clone(&services.remotes));
             teracopy::detect_in_background();
             quicklook::detect_in_background();
         }
@@ -558,9 +631,15 @@ fn app_main(mut args: Args) {
         }
         // The shell registration follows the setting in every process that is running, resident
         // or not (a standalone Arke started through the folder verb keeps it repaired too).
+        // Only the resident Arke answers COM, so only it decides whether the verbs use it.
         if bench.is_none()
             && let Some(handler) = folder_handler::Handler::real()
         {
+            let handler = if resident {
+                handler.with_com_check(Arc::new(win_folder_com::works))
+            } else {
+                handler
+            };
             folder_handler::follow_setting(&store, handler, cx);
         }
         if bench.is_none() {
@@ -590,6 +669,10 @@ fn app_main(mut args: Args) {
             update_quiet::mark_resident(resident, background);
             cx.on_app_quit(|cx| {
                 update_quiet::on_quit(cx);
+                // Arke's windows leave the shell's window list with it (#319).
+                win_folder_visit::end_all();
+                // The process ends right after: the last lines (why it quit) go in the file first.
+                crashlog::flush(Duration::from_millis(200));
                 async {}
             })
             .detach();
@@ -630,6 +713,9 @@ fn app_main(mut args: Args) {
             cx.quit();
             return;
         }
+        if let Some(text) = start_search.filter(|_| first_window_opened) {
+            search_computer(cx, text);
+        }
         if let Some(listener) = listener {
             start_resident_service(cx, listener, services, api_queue);
             quit_with_last_window_unless_resident(cx);
@@ -640,6 +726,17 @@ fn app_main(mut args: Args) {
         }
         if !benchmarking {
             prewarm_shell_host();
+            // What the system drive's Recycle Bin holds, for the first delete (#379).
+            win_fast_recycle::warm_up();
+            // How pinned Windows commands looked, for the first menu (#278).
+            let pinned = settings::SettingsStore::global(cx)
+                .read(cx)
+                .settings
+                .menu_pinned
+                .clone();
+            let _ = std::thread::Builder::new()
+                .name("menu-icons-load".into())
+                .spawn(move || menu_pin_looks::load(&pinned));
         }
         if !background {
             cx.activate(true);
@@ -649,12 +746,25 @@ fn app_main(mut args: Args) {
 
 /// Drives removed, locked or dismounted from outside Arke: watchers on them were already closed
 /// on the notification thread (`win_devnotify.rs`); here every window moves its tabs off the drive.
-fn follow_drive_removals(cx: &mut App) {
+/// A drive plugged in or pulled out also has every sidebar read its drives again.
+fn follow_drive_removals(cx: &mut App, remotes: Arc<arke_remote::Remotes>) {
     let events = win_devnotify::start();
+    // Phones already connected (#292); later ones arrive as `Phones` below.
+    remote_shell::refresh_phones(Arc::clone(&remotes), cx);
     cx.spawn(async move |cx| {
         while let Ok(event) = events.recv_async().await {
-            let win_devnotify::DriveEvent::Leaving(drive) = event;
-            cx.update(|cx| workspace::leave_drive_everywhere(&drive, cx));
+            match event {
+                win_devnotify::DriveEvent::Leaving(drive) => {
+                    cx.update(|cx| workspace::leave_drive_everywhere(&drive, cx));
+                }
+                win_devnotify::DriveEvent::Changed => {
+                    cx.update(workspace::reload_places_everywhere);
+                }
+                win_devnotify::DriveEvent::Phones => {
+                    let remotes = Arc::clone(&remotes);
+                    cx.update(|cx| remote_shell::refresh_phones(remotes, cx));
+                }
+            }
         }
     })
     .detach();
@@ -857,14 +967,73 @@ fn follow_win_e_hook(
 }
 
 /// Opens a window showing what an Explorer window showed. Answers whether Arke has a window.
+///
+/// The early path (#285) ends File Explorer's launcher before it opens a window, and the tab it
+/// opens here is marked (`Workspace::mark_early`). If that launcher had handed the folder over
+/// already, the window comes anyway and arrives here from the watcher like any other: while the
+/// marked tab still shows that folder, it comes forward with the window's selection instead of a
+/// second tab or window. The same happens for any other window on it then; nothing is closed
+/// without Arke showing it.
 fn open_taken_over(cx: &mut App, services: &Services, request: &win_takeover::OpenRequest) -> bool {
-    open_target(
+    let explorer_thread = Some(request.explorer_thread);
+    if !request.early && merge_into_early_tab(cx, &request.target, &request.select, explorer_thread)
+    {
+        return true;
+    }
+    let Some(window) = open_target_in(
         cx,
         services,
         request.target.clone(),
         &request.select,
-        Some(request.explorer_thread),
-    )
+        explorer_thread,
+        None,
+    ) else {
+        return false;
+    };
+    if request.early {
+        let _ = window.update(cx, |workspace, _, cx| {
+            workspace.mark_early(&request.target, cx);
+        });
+    }
+    true
+}
+
+/// A File Explorer window on `target` while a tab the early path opened still shows it (see
+/// [`open_taken_over`]): that tab comes forward, in whichever window it is, with `select` selected,
+/// and its mark is used up. With several, the newest mark wins: two quick launches of the same
+/// folder each get their own tab, and the window the second couldn't keep away goes to the
+/// second's. False when there is no such tab (closed, gone elsewhere, or used already).
+fn merge_into_early_tab(
+    cx: &mut App,
+    target: &Target,
+    select: &[String],
+    explorer_thread: Option<u32>,
+) -> bool {
+    let select: Vec<Arc<str>> = select.iter().map(|n| Arc::from(n.as_str())).collect();
+    let newest = {
+        let app: &App = cx;
+        app.windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<Workspace>())
+            .filter_map(|w| Some((w, w.read(app).ok()?.early_mark(target, app)?)))
+            .max_by_key(|&(_, mark)| mark)
+    };
+    let Some((handle, _)) = newest else {
+        return false;
+    };
+    let merged = handle.update(cx, |workspace, window, cx| {
+        let merged = workspace.merge_early(target, select, window, cx);
+        if merged {
+            bring_to_front(window, explorer_thread);
+        }
+        merged
+    });
+    if !matches!(merged, Ok(true)) {
+        return false;
+    }
+    log::info!("takeover: shown in the tab opened early for {target:?}");
+    cx.activate(true);
+    true
 }
 
 /// Shows a folder, Home or the Recycle Bin (with `select` selected) and brings it to the front: in
@@ -890,27 +1059,36 @@ fn open_target_timed(
     explorer_thread: Option<u32>,
     received: Option<Instant>,
 ) -> bool {
+    open_target_in(cx, services, target, select, explorer_thread, received).is_some()
+}
+
+/// [`open_target_timed`], giving the window `target` now shows in (its active tab).
+fn open_target_in(
+    cx: &mut App,
+    services: &Services,
+    target: Target,
+    select: &[String],
+    explorer_thread: Option<u32>,
+    received: Option<Instant>,
+) -> Option<gpui::WindowHandle<Workspace>> {
     let select: Vec<Arc<str>> = select.iter().map(|n| Arc::from(n.as_str())).collect();
     if let Some(host) = tab_host(cx)
         && show_in_tab(cx, host, target.clone(), select.clone(), explorer_thread)
     {
-        return true;
+        return Some(host);
     }
     // Win+E (File Explorer's Home) with no window open: Arke starting, as "New windows open to"
     // says (the last session, say).
     let asked =
         (target != Target::Home || last_window(cx).is_some()).then_some(Asked { target, select });
-    let opened = open_explorer_window(cx, services, asked, None, Instant::now(), received);
-    let Some(window) = opened else {
-        return false;
-    };
+    let window = open_explorer_window(cx, services, asked, None, Instant::now(), received)?;
     let shown = window.update(cx, |_, window, _| {
         bring_to_front(window, explorer_thread);
     });
     if shown.is_ok() {
         cx.activate(true);
     }
-    shown.is_ok()
+    shown.is_ok().then_some(window)
 }
 
 /// The window a folder from another program, Win+E or Arke started again open in as a tab: the
@@ -999,6 +1177,31 @@ fn handle_open(cx: &mut App, services: &Services, open: OpenRequest, received: I
         )
     } else {
         open_fresh(cx, services, received)
+    }
+}
+
+/// `arke.exe --search <text>` reaching the resident Arke: a window of its own that searches the
+/// whole computer, brought to the front.
+fn handle_search(cx: &mut App, services: &Services, text: String, received: Instant) -> bool {
+    let Some(handle) =
+        open_explorer_window(cx, services, None, None, Instant::now(), Some(received))
+    else {
+        return false;
+    };
+    let _ = handle.update(cx, |workspace, window, cx| {
+        bring_to_front(window, None);
+        workspace.search_computer(text, window, cx);
+    });
+    cx.activate(true);
+    true
+}
+
+/// Starts a whole computer search for `text` in the window used last.
+fn search_computer(cx: &mut App, text: String) {
+    if let Some(host) = last_window(cx) {
+        let _ = host.update(cx, |workspace, window, cx| {
+            workspace.search_computer(text, window, cx);
+        });
     }
 }
 
@@ -1208,6 +1411,18 @@ fn follow_jump_list(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App)
 
 /// "Language" setting: switch when loaded or changed and redraw all windows (input placeholders
 /// update in new tabs only).
+/// Updates go through the download route in Settings (`update_route.rs`).
+fn follow_update_route(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App) {
+    let apply = |store: &settings::SettingsStore| {
+        if store.loaded {
+            update_route::set(&store.settings.update_route);
+        }
+    };
+    apply(store.read(cx));
+    cx.observe(store, move |store, cx| apply(store.read(cx)))
+        .detach();
+}
+
 fn follow_language_setting(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App) {
     let mut applied: Option<settings::Language> = None;
     cx.observe(store, move |store, cx| {
@@ -1491,6 +1706,7 @@ fn start_resident_service(
                 }
                 Request::Select { folder, items } => select_items(cx, &services, &folder, &items),
                 Request::Open(open) => handle_open(cx, &services, open, received),
+                Request::Search(text) => handle_search(cx, &services, text, received),
                 // Answered on the pipe thread.
                 Request::Api(_) => false,
             });
@@ -1569,9 +1785,16 @@ fn apply_api(cx: &mut App, services: &Services, action: api::Action) {
                     .flatten()
             });
             if let Some(host) = host {
+                let front = commands::moves_focus(command.id);
                 let _ = host.update(cx, |workspace, window, cx| {
+                    if front {
+                        bring_to_front(window, None);
+                    }
                     workspace.api_run(command, window, cx);
                 });
+                if front {
+                    cx.activate(true);
+                }
             }
         }
     }
@@ -1806,7 +2029,7 @@ fn open_explorer_window(
     // touch locations that might block. No path given: if settings say "last location/last tabs",
     // open there (switching once settings finish loading).
     let first_window = cx.windows().is_empty();
-    let (last, mut sessions, place, single_window, loaded) = {
+    let (last, mut sessions, pinned, place, single_window, loaded) = {
         let store = settings::SettingsStore::global(cx).read(cx);
         let start = update::start_location(store.settings.start_location);
         let last =
@@ -1824,6 +2047,14 @@ fn open_explorer_window(
         } else {
             Vec::new()
         };
+        // Pinned tabs come back in front of a folder asked for whatever the start location is
+        // (#298); with the last tabs they are part of the session.
+        let pinned = (store.loaded
+            && first_window
+            && bench.is_none()
+            && start != settings::StartLocation::LastSession)
+            .then(|| store.settings.last_pinned_tabs())
+            .filter(|s| !s.tabs.is_empty());
         // Window position: the first window uses the last one; later windows are centered instead
         // of stacking.
         let place = (first_window && bench.is_none())
@@ -1835,6 +2066,7 @@ fn open_explorer_window(
         (
             last,
             sessions,
+            pinned,
             place,
             store.settings.single_window,
             store.loaded,
@@ -1864,6 +2096,9 @@ fn open_explorer_window(
         let handle = open_workspace_window(cx, services, start, bench, started_at, received)?;
         let _ = handle.update(cx, |workspace, window, cx| {
             workspace.show_taken_over(asked.target, asked.select, window, cx);
+            if let Some(pinned) = &pinned {
+                workspace.restore_session_before(pinned, window, cx);
+            }
             // Settings not read yet: the last session may still come back around this window.
             if wait_for_session {
                 workspace.restore_session_when_read();
@@ -2018,6 +2253,23 @@ mod arg_tests {
         parse_args_from(args.iter().map(std::ffi::OsString::from))
     }
 
+    /// A folder whose name has a lone surrogate (valid on NTFS, not valid Unicode) no longer
+    /// panics at startup: the flags are still read, the folder keeps its exact name.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_name_that_isnt_unicode_doesnt_stop_startup() {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        let mut wide: Vec<u16> = r"C:\a".encode_utf16().collect();
+        wide.push(0xD800);
+        let folder = std::ffi::OsString::from_wide(&wide);
+        let flags = text_args_from(["arke.exe".into(), "--api".into(), folder.clone()].into_iter());
+        assert_eq!(flags[1], "--api");
+        assert_eq!(flags[2], "C:\\a\u{FFFD}");
+        let args = parse_args_from([folder].into_iter());
+        let kept: Vec<u16> = args.path.unwrap().as_os_str().encode_wide().collect();
+        assert_eq!(kept, wide, "the folder argument is read as it is");
+    }
+
     #[test]
     fn the_shells_drive_root_argument_gets_its_backslash_back() {
         // `"arke.exe" "C:\"` arrives as `C:"`.
@@ -2033,12 +2285,37 @@ mod arg_tests {
         assert_eq!(parse(&[r"C:\"]).path, Some(PathBuf::from(r"C:\")));
     }
 
+    /// The copy started again without RedirectionGuard reads its arguments like the first one.
+    #[test]
+    fn the_relaunch_marker_is_not_a_path() {
+        use crate::redirection_guard::RELAUNCHED_ARG;
+        let args = parse(&[RELAUNCHED_ARG]);
+        assert!(args.path.is_none() && args.page.is_none() && !args.new_window);
+        let args = parse(&[RELAUNCHED_ARG, r"D:\work", "--new-window"]);
+        assert_eq!(args.path, Some(PathBuf::from(r"D:\work")));
+        assert!(args.new_window);
+    }
+
     #[test]
     fn home_and_restore_flags_are_not_paths() {
         let args = parse(&["--home"]);
         assert!(args.page.is_none() && args.path.is_none() && !args.restore_explorer);
         let args = parse(&["--restore-explorer"]);
         assert!(args.restore_explorer && args.path.is_none() && args.page.is_none());
+    }
+
+    #[test]
+    fn search_takes_the_text_after_it() {
+        assert_eq!(
+            parse(&["--search", "tax return"]).search.as_deref(),
+            Some("tax return")
+        );
+        let args = parse(&["--search", "  notes ", r"C:\work"]);
+        assert_eq!(args.search.as_deref(), Some("notes"));
+        assert_eq!(args.path, Some(PathBuf::from(r"C:\work")));
+        assert_eq!(parse(&["--search"]).search, None);
+        assert_eq!(parse(&["--search", " "]).search, None);
+        assert_eq!(parse(&[r"C:\work"]).search, None);
     }
 
     #[test]

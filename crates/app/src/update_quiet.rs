@@ -452,6 +452,7 @@ pub(crate) fn restore(file: PathBuf, cx: &mut App) {
         exe_name: name,
         size: 0,
         sha_url: None,
+        sig_url: String::new(),
         notes: String::new(),
         page: String::new(),
     };
@@ -719,7 +720,7 @@ impl Host for RealHost {
     fn apply(&self, file: &Path, launch: Launch) -> Result<Applied, UpdateError> {
         if update::is_setup(file) {
             let mut setup = std::process::Command::new(file);
-            setup.args(update::SETUP_SILENT);
+            setup.args(update::setup_flags(self.installs_silently()));
             match launch {
                 Launch::Nothing => {}
                 Launch::Background => {

@@ -35,6 +35,10 @@ Zed's Windows platform crate (Apache-2.0), unchanged except for:
     recovery doesn't wait for the next frame.
 
   Worth offering upstream (Zed has the same loop).
+- Quieter log (`src/window.rs` `calculate_window_bounds` and `mouse_position`): a failed
+  `GetWindowPlacement` is logged only while the window still exists (it fails for every window
+  being closed), and a failed `GetCursorPos` (the screen is locked) is a debug line, not an
+  error.
 - Touchpad gestures over an idle window (`src/events.rs` `handle_dm_pointer_hit_test` and
   `draw_window`, `src/direct_manipulation.rs` `interacting`): Direct Manipulation's updates are
   only read in `draw_window`, and an idle window doesn't draw (see Idle vsync above). A touchpad
@@ -103,3 +107,59 @@ Zed's Windows platform crate (Apache-2.0), unchanged except for:
   before the message returns `TRUE`. This runs before the window state is looked at, and the
   handler must not touch GPUI (Arke answers from a snapshot, see `crates/app/src/api.rs` and
   `docs/integration.md`). Other `WM_COPYDATA` messages get the default handling. (#193)
+- `src/direct_write.rs` `get_name`: a font with no name in the UI locale or in en-us (a Chinese
+  font named only in zh-TW, on a zh-CN system) takes its first name instead of failing, so it is
+  no longer left out of the font list with a "No localised string" error per font. (#343)
+- `src/window.rs` `begin_modal_drag`, `DispatchingInput` and `on_input`, and `src/events.rs`
+  `handle_hit_test_msg`: while an input callback runs (the app is borrowed then) or while Arke runs
+  Windows' modal drag loop, `WM_NCHITTEST` doesn't ask the app where the window controls are.
+  Asking could only fail: during a drag out of Arke it logged a "RefCell already borrowed" error on
+  every mouse move. Arke's `crates/app/src/win_fileops.rs` `drag_out` holds the drag guard; the
+  input count is kept by the wrapper `on_input` puts around the callback. (#338, #343)
+- `src/window.rs` `a11y_init`: the accessibility adapter starts out knowing the window is focused
+  when it is the active window (`GetActiveWindow`, what `WM_ACTIVATE` reports), not only when it
+  is the foreground window. The first `WM_ACTIVATE` comes before the adapter exists, and the
+  window isn't always the foreground one yet at that point; when it becomes so, no second
+  `WM_ACTIVATE` follows. The adapter then thought the window never had focus, so screen readers
+  were given no focused element: NVDA read nothing in the main window or Settings. (#322)
+
+## gpui-pre 0.3.11
+
+Zed's GPUI (Apache-2.0), unchanged except for:
+
+- `src/elements/div.rs` `InteractiveElement::on_focused_bounds` (`Interactivity::focused_bounds_listener`,
+  called in `Interactivity::prepaint`): a listener given the element's bounds each time it is
+  prepainted while it has the focus. Arke's Settings scroll the control Tab moved to into view with
+  it (`crates/app/src/keynav.rs`); upstream has no way to learn where an implicitly focusable element
+  is. (#322)
+- `src/elements/div.rs` `a11y_click_listeners` and the accessibility block of `Interactivity::paint`:
+  an assistive technology's Click on an element with click listeners runs them, as Enter on the
+  focused element does (`ClickEvent::Keyboard`). Upstream, Click falls back to a synthetic mouse
+  click at the element's position: a button scrolled out of view (the sidebar's "Add network
+  location…" in a short window, a Settings button below the fold) couldn't be pressed with a
+  screen reader, and the click could land on whatever was drawn there instead. Elements that
+  handle Click themselves (`on_a11y_action`) are left alone. (#322)
+- `src/elements/div.rs` `StatefulInteractiveElement::a11y_key` and `a11y_parent` (applied in the
+  accessibility block of `Interactivity::prepaint`) and `src/window/a11y.rs` `A11yNodeBuilder`
+  `name_current`, `move_current_under` and `apply_moves` (run in `finalize`): an element's node
+  can be put under a node named earlier in the frame instead of its nearest ancestor's, like
+  `aria-owns`. Arke's sidebar draws its folder tree as a flat list of rows, so every row was a
+  sibling of the others under the tree, and NVDA, which counts a tree item's level from the tree
+  items above it rather than reading its level, read every folder as "level 1". Each row now goes
+  under its parent folder's row (`crates/app/src/a11y.rs` `a11y_tree_row`), with no change to
+  layout. (#322)
+
+The test platform, which only builds with the `test-support` feature:
+
+- `src/platform/test/window.rs`: `TestWindow` keeps the accessibility callbacks `a11y_init` is
+  given (upstream it ignores them, so a test window never builds an accessibility tree), and adds
+  `simulate_a11y_activation`, `simulate_a11y_deactivation` and `simulate_a11y_action`.
+- `src/app/test_context.rs`: `TestAppContext::simulate_window_a11y_activation` and
+  `simulate_window_a11y_action`, and `VisualTestContext::simulate_a11y_activation` and
+  `simulate_a11y_action`, which run until parked.
+
+With them, tests read what a screen reader is given through `Window::debug_a11y_tree_json`
+(`crates/app/src/tests_a11y.rs`, #322).
+
+The `examples`, `tests` and `benches` folders and their
+`Cargo.toml` entries are left out. Offered upstream; drop this copy once a gpui-pre has it.

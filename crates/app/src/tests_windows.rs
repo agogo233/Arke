@@ -154,6 +154,7 @@ fn active_tab(window: gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) ->
 fn saved_window(paths: &[&str], place: Option<WindowPlace>) -> SessionWindow {
     SessionWindow {
         session: Session {
+            workspace: None,
             tabs: paths.iter().map(|path| tab(path)).collect(),
             active: 0,
         },
@@ -229,6 +230,172 @@ fn with_single_window_off_each_folder_gets_a_window(cx: &mut TestAppContext) {
     assert_eq!(windows.len(), 2);
     assert_eq!(tabs_of(windows[0], cx), [Some(p(r"C:\a"))]);
     assert_eq!(tabs_of(windows[1], cx), [Some(p(r"C:\b"))]);
+}
+
+/// What "Open folders in Arke" asks for: from the early path (File Explorer's launcher ended) or
+/// from the watcher (a File Explorer window).
+fn taken_over(path: &str, select: &[&str], early: bool) -> crate::win_takeover::OpenRequest {
+    let (reply, _) = flume::bounded(1);
+    crate::win_takeover::OpenRequest {
+        target: arke_core::takeover::Target::Folder(p(path)),
+        select: select.iter().map(|name| (*name).to_owned()).collect(),
+        explorer_thread: 0,
+        early,
+        reply,
+    }
+}
+
+fn until(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The window `open` made, among those not in `before`.
+fn opened_window(
+    cx: &mut TestAppContext,
+    before: &[gpui::WindowId],
+    open: impl FnOnce(&mut TestAppContext) -> bool,
+) -> gpui::WindowHandle<Workspace> {
+    assert!(open(cx));
+    cx.run_until_parked();
+    workspaces(cx)
+        .into_iter()
+        .find(|w| !before.contains(&w.window_id()))
+        .expect("a window of its own")
+}
+
+fn window_ids(cx: &TestAppContext) -> Vec<gpui::WindowId> {
+    workspaces(cx).iter().map(|w| w.window_id()).collect()
+}
+
+/// The active list of `window`, once it shows `path`.
+fn loaded_view(
+    cx: &mut TestAppContext,
+    window: gpui::WindowHandle<Workspace>,
+    path: &str,
+) -> Entity<Explorer> {
+    let view = cx.update(|cx| window.read(cx).unwrap().active_view().clone());
+    let done = loaded(path);
+    until(cx, path, |cx| cx.update(|cx| done(view.read(cx))));
+    view
+}
+
+fn selection(cx: &mut TestAppContext, view: &Entity<Explorer>) -> Vec<String> {
+    cx.update(|cx| selected_names(view.read(cx)))
+}
+
+/// #285, single window mode off: the folder the early path opened gets a window. A File Explorer
+/// window on it that comes anyway (its launcher had handed it over already) shows in that tab with
+/// its selection instead of in a window of its own, once: the next one opens as any other. A tab
+/// that went elsewhere keeps no mark, even once it is back.
+#[gpui::test]
+fn a_late_explorer_window_uses_the_early_tab_once(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    let (ws, vcx) = setup_workspace(cx, Arc::clone(&fs), r"C:\a");
+    let first = ws.update(vcx, |ws, _| ws.active_view().clone());
+    wait_until(vcx, &first, "a", loaded(r"C:\a"));
+    let cx = &mut vcx.cx;
+    settings(cx, |s| s.single_window = false);
+    let services = services(&fs);
+    let open = |cx: &mut TestAppContext, request: crate::win_takeover::OpenRequest| {
+        cx.update(|cx| crate::open_taken_over(cx, &services, &request))
+    };
+
+    let before = window_ids(cx);
+    let early = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\b", &[], true)));
+    let view = loaded_view(cx, early, r"C:\b");
+
+    // The window comes anyway, with the item selected.
+    assert!(open(cx, taken_over(r"C:\b", &["file_000000.txt"], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 2, "no window of its own");
+    assert_eq!(tabs_of(early, cx), [Some(p(r"C:\b"))], "no second tab");
+    until(cx, "the window's selection", |cx| {
+        cx.update(|cx| selected_names(view.read(cx)) == ["file_000000.txt"])
+    });
+    // The mark is used up: the next window on it opens as usual.
+    assert!(open(cx, taken_over(r"C:\b", &[], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 3, "a window as usual");
+
+    // A tab that goes elsewhere loses its mark, even once it is back.
+    let before = window_ids(cx);
+    let early = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\c", &[], true)));
+    let view = loaded_view(cx, early, r"C:\c");
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.navigate(p(r"C:\d"), arke_core::NavKind::New, cx);
+        });
+    });
+    let _ = loaded_view(cx, early, r"C:\d");
+    cx.update(|cx| {
+        view.update(cx, |v, cx| {
+            v.navigate(p(r"C:\c"), arke_core::NavKind::New, cx);
+        });
+    });
+    let _ = loaded_view(cx, early, r"C:\c");
+    assert!(open(cx, taken_over(r"C:\c", &[], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 5, "not marked any more");
+}
+
+/// #285: two quick `explorer.exe C:\b`, both launchers ended, the second just too late, so its
+/// window comes anyway. Each launch has a window, and the late window goes to the second's (the
+/// newest mark), not the first's: no duplicate. Each mark is used once.
+#[gpui::test]
+fn two_quick_launches_each_get_their_own_merge(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    let (ws, vcx) = setup_workspace(cx, Arc::clone(&fs), r"C:\a");
+    let first = ws.update(vcx, |ws, _| ws.active_view().clone());
+    wait_until(vcx, &first, "a", loaded(r"C:\a"));
+    let cx = &mut vcx.cx;
+    settings(cx, |s| s.single_window = false);
+    let services = services(&fs);
+    let open = |cx: &mut TestAppContext, request: crate::win_takeover::OpenRequest| {
+        cx.update(|cx| crate::open_taken_over(cx, &services, &request))
+    };
+
+    let before = window_ids(cx);
+    let one = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\b", &[], true)));
+    let before = window_ids(cx);
+    let two = opened_window(cx, &before, |cx| open(cx, taken_over(r"C:\b", &[], true)));
+    let one_view = loaded_view(cx, one, r"C:\b");
+    let two_view = loaded_view(cx, two, r"C:\b");
+    assert_eq!(workspaces(cx).len(), 3);
+
+    // The second launch's window, with its item selected: the newest mark.
+    assert!(open(cx, taken_over(r"C:\b", &["file_000000.txt"], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 3, "no duplicate");
+    until(cx, "the second tab's selection", |cx| {
+        cx.update(|cx| selected_names(two_view.read(cx)) == ["file_000000.txt"])
+    });
+    assert!(
+        selection(cx, &one_view).is_empty(),
+        "the first tab untouched"
+    );
+
+    // One more on it goes to the first launch's tab, whose mark is left; then none are.
+    assert!(open(cx, taken_over(r"C:\b", &["file_000000.txt"], false)));
+    cx.run_until_parked();
+    assert_eq!(workspaces(cx).len(), 3);
+    until(cx, "the first tab's selection", |cx| {
+        cx.update(|cx| selected_names(one_view.read(cx)) == ["file_000000.txt"])
+    });
+    assert!(open(cx, taken_over(r"C:\b", &[], false)));
+    cx.run_until_parked();
+    assert_eq!(
+        workspaces(cx).len(),
+        4,
+        "every mark used: a window as usual"
+    );
 }
 
 /// The forum report: with two windows open, the second one's tabs no longer replace the
@@ -606,4 +773,139 @@ fn folders_visited_before_the_file_is_read_are_written_with_it(cx: &mut TestAppC
         "{written}"
     );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// A saved window whose tabs are the given folders, the ones in `pinned` pinned.
+fn saved_window_with_pins(paths: &[&str], pinned: &[&str]) -> SessionWindow {
+    SessionWindow {
+        session: Session {
+            workspace: None,
+            tabs: paths
+                .iter()
+                .map(|path| SessionTab {
+                    pinned: pinned.contains(path),
+                    ..tab(path)
+                })
+                .collect(),
+            active: 0,
+        },
+        place: None,
+    }
+}
+
+/// Pinned tabs come back like a browser's even when the start location is not "Last tabs" (#298):
+/// pinned, in their order, in front of the usual start tab, which is the active one.
+#[gpui::test]
+fn pinned_tabs_come_back_when_last_tabs_is_off(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    no_window_yet(cx);
+    settings(cx, |s| {
+        s.start_location = StartLocation::Home;
+        s.session_windows = vec![saved_window_with_pins(
+            &[r"C:\a", r"C:\b", r"C:\c"],
+            &[r"C:\a", r"C:\c"],
+        )];
+    });
+    let services = services(&fs);
+    assert!(cx.update(|cx| crate::open_explorer(cx, &services, None, None, Instant::now())));
+    settle(cx);
+    let windows = workspaces(cx);
+    assert_eq!(windows.len(), 1, "only the window of the start location");
+    let window = windows[0];
+    let tabs = tabs_of(window, cx);
+    assert_eq!(tabs.len(), 3, "two pinned tabs and the start tab: {tabs:?}");
+    assert_eq!(tabs[..2], [Some(p(r"C:\a")), Some(p(r"C:\c"))]);
+    // The unpinned tab stays closed.
+    assert!(!tabs.contains(&Some(p(r"C:\b"))));
+    cx.update(|cx| {
+        let ws = window.read(cx).unwrap();
+        assert_eq!(ws.pinned_for_test(), [true, true, false]);
+        assert_eq!(ws.active, 2, "the start tab is the active one");
+    });
+}
+
+/// Opened on a folder (Win+E with Arke as the default, "Open in Arke"), the pinned tabs come back
+/// in front of it too, and the folder asked for is the active tab (#298).
+#[gpui::test]
+fn pinned_tabs_come_back_around_a_folder_asked_for(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    no_window_yet(cx);
+    settings(cx, |s| {
+        s.start_location = StartLocation::Home;
+        s.session_windows = vec![saved_window_with_pins(
+            &[r"C:\a", r"C:\b", r"C:\c"],
+            &[r"C:\a", r"C:\c"],
+        )];
+    });
+    let services = services(&fs);
+    let opened =
+        cx.update(|cx| crate::open_explorer(cx, &services, Some(p(r"C:\d")), None, Instant::now()));
+    assert!(opened);
+    settle(cx);
+    let windows = workspaces(cx);
+    assert_eq!(windows.len(), 1);
+    let window = windows[0];
+    let tabs = tabs_of(window, cx);
+    assert_eq!(
+        tabs,
+        [Some(p(r"C:\a")), Some(p(r"C:\c")), Some(p(r"C:\d"))],
+        "pinned tabs, then the folder asked for"
+    );
+    cx.update(|cx| {
+        let ws = window.read(cx).unwrap();
+        assert_eq!(ws.pinned_for_test(), [true, true, false]);
+        assert_eq!(ws.active, 2, "the folder asked for is the active tab");
+    });
+}
+
+/// Without a pinned tab in the last session, the start location alone decides, as before.
+#[gpui::test]
+fn no_pinned_tabs_leaves_the_start_alone(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    no_window_yet(cx);
+    settings(cx, |s| {
+        s.start_location = StartLocation::Home;
+        s.session_windows = vec![saved_window(&[r"C:\a", r"C:\b"], None)];
+    });
+    let services = services(&fs);
+    assert!(cx.update(|cx| crate::open_explorer(cx, &services, None, None, Instant::now())));
+    settle(cx);
+    let windows = workspaces(cx);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(tabs_of(windows[0], cx).len(), 1);
+}
+
+/// A pinned tab is saved in the session whatever the start location is, so the next start can
+/// bring it back.
+#[gpui::test]
+fn a_pinned_tab_is_saved_when_last_tabs_is_off(cx: &mut TestAppContext) {
+    let fs = fake_fs();
+    no_window_yet(cx);
+    settings(cx, |s| s.start_location = StartLocation::Home);
+    let services = services(&fs);
+    assert!(cx.update(|cx| crate::open_explorer(cx, &services, None, None, Instant::now())));
+    settle(cx);
+    let window = workspaces(cx)[0];
+    window
+        .update(cx, |ws, window, cx| {
+            ws.open_tab(p(r"C:\a"), 1, true, window, cx);
+            ws.toggle_pin(1, cx);
+        })
+        .unwrap();
+    settle(cx);
+    // The next start brings that tab back.
+    let pinned = cx.update(|cx| {
+        SettingsStore::global(cx)
+            .read(cx)
+            .settings
+            .last_pinned_tabs()
+    });
+    assert_eq!(
+        pinned
+            .tabs
+            .iter()
+            .map(|t| t.panes.clone())
+            .collect::<Vec<_>>(),
+        [vec![p(r"C:\a")]]
+    );
 }

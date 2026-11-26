@@ -526,6 +526,9 @@ impl Explorer {
         };
         spawn_thread("folder-sizes", move || {
             worker.started = true;
+            // Not in tests: a lowest-priority thread can starve for many seconds while the whole
+            // suite saturates the CPU, and the tests wait on it with a wall-clock deadline.
+            #[cfg(not(test))]
             crate::win::lower_io_priority();
             let queue = Arc::clone(&worker.queue);
             let path = &queue.dir;
@@ -648,6 +651,32 @@ impl Explorer {
     #[cfg(test)]
     pub(crate) fn folder_sizes_computing(&self) -> bool {
         self.folder_sizes.computing()
+    }
+
+    /// The folder sizes' bookkeeping, for a test that timed out waiting on them.
+    #[cfg(test)]
+    pub(crate) fn folder_sizes_state(&self) -> String {
+        let f = &self.folder_sizes;
+        let queue = f.queue.as_ref().map(|q| {
+            let (todo, running) = {
+                let t = q.todo.lock();
+                (
+                    t.0.iter().map(|x| Arc::clone(&x.0)).collect::<Vec<_>>(),
+                    t.1,
+                )
+            };
+            let cancel = q.cancel.load(Ordering::Relaxed);
+            format!("todo={todo:?} running={running} cancel={cancel}")
+        });
+        format!(
+            "dir={:?} sizes={:?} pending={:?} waiting={:?} stale={} queue={queue:?} rev={}",
+            f.dir,
+            f.sizes,
+            f.pending,
+            f.waiting.keys().collect::<Vec<_>>(),
+            f.stale,
+            f.rev
+        )
     }
 
     /// What the Size column shows for subfolder `name`.

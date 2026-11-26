@@ -9,12 +9,14 @@
 //! - a packaged app's command (Windows Terminal, VS Code, Zed): 2 to 140 ms, its
 //!   `IExplorerCommand` created alone (`win_menu_single.rs`).
 //!
-//! The rows of registry and packaged commands are known to show before they answer (the
-//! registry says so, or the item kinds the app registered them for), so they are drawn right
-//! away with the label and icon they had, and a click before the source is in runs the command
-//! once it is. An extension's row is drawn ahead too where the extension showed it for the same
-//! kind of item last time (`menu_pin_seen`): loading a third-party DLL and asking it for its
-//! items takes it 40 ms to a second, and the row was waiting on that. If it turns out not to
+//! A packaged command's row is known to show before it answers (the item kinds the app
+//! registered it for), so it is drawn right away with the label and icon it had, and a click
+//! before the source is in runs the command once it is. An extension's or a registry command's
+//! row is drawn ahead where it showed for the same kind of item before (`menu_pin_seen`, noted
+//! from its source and from the whole menu): being listed doesn't say it shows, since an
+//! extension decides for itself and Windows leaves a registry command out where it doesn't apply
+//! ("Run as administrator" listed for a zip, #325). Loading a third-party DLL and asking it for
+//! its items takes it 40 ms to a second, and the row was waiting on that. If it turns out not to
 //! add it this time, the row goes away when it answers. The whole menu still fills "Show more options", and once it is in, the pinned rows
 //! come from it.
 //!
@@ -37,7 +39,7 @@ use super::{ContextMenu, MenuEntry, find_pinned, pin_key};
 use crate::explorer::{AppEvent, Explorer, spawn_thread};
 use crate::settings::SettingsStore;
 use crate::shell::{ShellError, ShellMenu, ShellMenuEntry};
-use crate::win_menu_parts::{COMMAND_OWNER, HandlerKind, MenuHandler, kind_matches};
+use crate::win_menu_parts::{COMMAND_OWNER, HandlerKind, MenuHandler, VERB_OWNER, kind_matches};
 
 /// A pinned command learned to come from none of the sources read on their own.
 pub(crate) const NO_OWNER: &str = "-";
@@ -102,11 +104,29 @@ impl Explorer {
         let Some((paths, background)) = self.menu_paths(menu) else {
             return;
         };
-        if owned.is_empty() {
+        // "Send to" is read on its own for every menu on items: the host lists it from its
+        // folder in a few ms, and it takes the place of Windows' own under "Show more options"
+        // (#278).
+        let send_to = !background;
+        if owned.is_empty() && !send_to {
             return;
         }
         let extended = menu.extended;
         menu.parts_request = Some(request);
+        // Rows known to show for this kind of item are drawn now, with the menu, from what was
+        // seen before (#325: they came a moment after it, once the registry had been read).
+        // The sources still say, and a row that doesn't show this time goes.
+        let now = crate::win_menu_parts::item_kind_known(menu.targets.first(), background)
+            .map_or_else(Vec::new, |kind| drawn_now(&owned, &types, &seen, &kind));
+        if !now.is_empty() {
+            menu.coming = now;
+            let pinned = SettingsStore::global(cx)
+                .read(cx)
+                .settings
+                .menu_pinned
+                .clone();
+            menu.sync_pinned(&pinned);
+        }
         let shell = Arc::clone(&self.services.shell);
         let tx = self.events_tx.clone();
         spawn_thread("menu-extensions", move || {
@@ -120,8 +140,11 @@ impl Explorer {
                     HandlerKind::Verb { extended: only } => !only || extended,
                     _ => true,
                 })
-                .filter(|h| is_owner(&h.owner()))
+                .filter(|h| is_owner(&h.owner()) || (send_to && h.is_send_to()))
                 .collect();
+            if send_to && !wanted.iter().any(MenuHandler::is_send_to) {
+                wanted.push(MenuHandler::send_to());
+            }
             // Packaged commands: by the item kinds they are for.
             let kind = shell.shell_menu_kind(&paths, background);
             for (_, owner) in &owned {
@@ -133,35 +156,40 @@ impl Explorer {
                     wanted.push(MenuHandler::command(clsid));
                 }
             }
-            // Rows known to show, and an extension's where it showed for this kind of item last
-            // time (it decides for itself whether it adds its item).
-            let shown_here = |key: &str| {
-                kind.as_ref().is_some_and(|kind| {
-                    seen.get(key)
-                        .is_some_and(|kinds| kinds.iter().any(|k| k.eq_ignore_ascii_case(kind)))
-                })
-            };
+            // A packaged command's row (its app registered it for this kind of item), and an
+            // extension's or a registry command's where it showed for this kind of item last
+            // time. Neither is sure to show from being listed: an extension decides for itself,
+            // and Windows leaves a registry command out where it doesn't apply ("Run as
+            // administrator" listed for a zip, #325). Drawn ahead there, the row came a moment
+            // after the menu and went again, on every menu.
+            let shown_here =
+                |key: &str| kind.as_ref().is_some_and(|kind| seen_for(&seen, key, kind));
             let keys: Vec<String> = owned
                 .iter()
                 .filter(|(key, o)| {
                     wanted.iter().any(|h| {
                         h.owner().eq_ignore_ascii_case(o)
-                            && (h.kind != HandlerKind::Extension || shown_here(key))
+                            && (h.kind == HandlerKind::Command || shown_here(key))
                     })
                 })
                 .map(|(key, _)| key.clone())
                 .collect();
-            if !keys.is_empty() {
-                let _ = tx.send(AppEvent::ShellMenu(ShellMenuEvent::Coming {
-                    request,
-                    keys,
-                }));
-            }
+            // Sent even when empty: it also takes away rows drawn when the menu opened that
+            // have no source here this time.
+            let _ = tx.send(AppEvent::ShellMenu(ShellMenuEvent::Coming {
+                request,
+                keys,
+            }));
             for handler in wanted {
                 let (shell, tx, paths) = (Arc::clone(&shell), tx.clone(), paths.clone());
-                let kind = (handler.kind == HandlerKind::Extension)
-                    .then(|| kind.clone())
-                    .flatten();
+                // Where its pinned rows show, to draw them with the menu next time: an
+                // extension's, and a registry command's (not one shown only with Shift held).
+                let noted = match handler.kind {
+                    HandlerKind::Extension => true,
+                    HandlerKind::Verb { extended: only } => !only && !extended,
+                    HandlerKind::Command => false,
+                };
+                let kind = noted.then(|| kind.clone()).flatten();
                 spawn_thread("menu-extension", move || {
                     let result =
                         shell.shell_menu_handler(&paths, background, extended, &handler, request);
@@ -186,7 +214,19 @@ impl Explorer {
         else {
             return;
         };
-        menu.coming = keys;
+        // Rows drawn with the menu stay where they still have a source; the others go.
+        let gone: Vec<String> = menu
+            .coming
+            .iter()
+            .filter(|k| !keys.contains(k))
+            .cloned()
+            .collect();
+        menu.drop_coming(&gone);
+        for key in keys {
+            if !menu.coming.contains(&key) {
+                menu.coming.push(key);
+            }
+        }
         let pinned = SettingsStore::global(cx)
             .read(cx)
             .settings
@@ -242,15 +282,17 @@ impl Explorer {
             self.services.shell.release_shell_menu(part.session);
             return;
         };
-        let entries: Vec<MenuEntry> = part
-            .entries
+        let entries: Vec<MenuEntry> = named_as_pinned(part.entries, owner, &expected)
             .into_iter()
             .map(|e| MenuEntry::from_shell_in(e, &[], Some(part.session)))
             .collect();
         // Rows drawn ahead that this source turned out not to have (hidden for these items).
+        // Only a source read in full says so: one cut short may still have them, and taking
+        // that for "not shown here" kept them from being drawn ahead next time (#278).
         let (shown, missing): (Vec<String>, Vec<String>) = expected
             .into_iter()
             .partition(|key| find_pinned(&entries, key).is_some());
+        let missing = if part.partial { Vec::new() } else { missing };
         menu.drop_coming(&missing);
         // An extension: where its rows can be drawn ahead next time.
         if let Some(kind) = kind {
@@ -260,6 +302,14 @@ impl Explorer {
                 .chain(missing.into_iter().map(|key| (key, kind.clone(), false)))
                 .collect();
             cx.defer(move |cx| note_pin_seen(seen, cx));
+        }
+        if owner.eq_ignore_ascii_case(crate::win_menu_parts::SEND_TO)
+            && let Some(MenuEntry::Submenu {
+                label, children, ..
+            }) = entries.first()
+        {
+            menu.send_to = Some((label.clone(), children.clone()));
+            menu.apply_send_to();
         }
         menu.parts.push((part.session, entries));
         menu.sync_pinned(&pinned);
@@ -285,11 +335,17 @@ impl Explorer {
         let mut unknown: Vec<(String, Option<String>)> = Vec::new();
         let mut packaged: Vec<String> = Vec::new();
         for key in &settings.menu_pinned {
-            let Some(item) = find_pinned(children, key) else {
+            let Some(entry) = find_pinned(children, key) else {
                 continue;
             };
+            // A whole submenu has no verb: the extension whose menu has it is found by reading
+            // them, as for an extension's item.
+            let verb = match entry {
+                MenuEntry::Item(item) => item.verb.clone(),
+                _ => None,
+            };
             match settings.menu_pin_owners.get(key).map(String::as_str) {
-                None | Some("") => unknown.push((key.clone(), item.verb.clone())),
+                None | Some("") => unknown.push((key.clone(), verb)),
                 Some(owner) if owner.starts_with(COMMAND_OWNER) => {
                     packaged.push(owner.to_string());
                 }
@@ -302,6 +358,8 @@ impl Explorer {
         if unknown.is_empty() && packaged.is_empty() {
             return;
         }
+        // A menu opened with Shift also has commands that show only with it.
+        let extended = menu.extended;
         let shell = Arc::clone(&self.services.shell);
         let tx = self.events_tx.clone();
         spawn_thread("menu-learn", move || {
@@ -309,10 +367,11 @@ impl Explorer {
             let (owners, mut types) =
                 find_owners(shell.as_ref(), &paths, background, &unknown, request);
             if let Some(kind) = &kind {
-                // Extensions' commands learned in this menu showed for this kind of item.
+                // Extensions' and registry commands learned in this menu showed for this kind
+                // of item: their rows are drawn ahead for it from now on.
                 let seen: Vec<(String, String, bool)> = owners
                     .iter()
-                    .filter(|(_, o)| is_clsid(o))
+                    .filter(|(_, o)| is_clsid(o) || (o.starts_with(VERB_OWNER) && !extended))
                     .map(|(key, _)| (key.clone(), kind.clone(), true))
                     .collect();
                 if !seen.is_empty() {
@@ -343,6 +402,9 @@ impl Explorer {
         event: ShellMenuEvent,
         cx: &mut Context<Self>,
     ) {
+        let Some(event) = self.keep_for_early_menu(event) else {
+            return;
+        };
         match event {
             ShellMenuEvent::Whole { request, result } => {
                 self.handle_shell_menu(request, result, cx);
@@ -381,6 +443,58 @@ impl Explorer {
         };
         (!paths.is_empty()).then_some((paths, background))
     }
+}
+
+/// A registry command Windows names itself, as "Run as administrator" (`runas`): the registry
+/// has no label for it, so its own menu calls it by the verb. It is the pinned command learned
+/// to come from it, named as in the whole Windows menu (#325: taken for missing, its row went
+/// until the whole menu was in).
+fn named_as_pinned(
+    mut entries: Vec<ShellMenuEntry>,
+    owner: &str,
+    expected: &[String],
+) -> Vec<ShellMenuEntry> {
+    let (Some(verb), [key]) = (owner.strip_prefix(VERB_OWNER), expected) else {
+        return entries;
+    };
+    if key.contains(" › ") {
+        return entries;
+    }
+    for entry in &mut entries {
+        if let ShellMenuEntry::Item { label, .. } = entry
+            && label.eq_ignore_ascii_case(verb)
+        {
+            label.clone_from(key);
+        }
+    }
+    entries
+}
+
+/// Pinned commands (pin key, owner) to draw as a menu for items of `kind` opens: a packaged
+/// command registered for that kind, any other seen there last time.
+fn drawn_now(
+    owned: &[(String, String)],
+    types: &std::collections::BTreeMap<String, Vec<String>>,
+    seen: &std::collections::BTreeMap<String, Vec<String>>,
+    kind: &str,
+) -> Vec<String> {
+    owned
+        .iter()
+        .filter(|(key, owner)| {
+            if owner.starts_with(COMMAND_OWNER) {
+                types.get(owner).is_some_and(|t| kind_matches(t, kind))
+            } else {
+                seen_for(seen, key, kind)
+            }
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Whether pinned command `key` showed for items of `kind` last time.
+fn seen_for(seen: &std::collections::BTreeMap<String, Vec<String>>, key: &str, kind: &str) -> bool {
+    seen.get(key)
+        .is_some_and(|kinds| kinds.iter().any(|k| k.eq_ignore_ascii_case(kind)))
 }
 
 /// Notes for which kinds of item extensions' pinned commands showed (pin key, kind, shown),
@@ -592,7 +706,8 @@ fn is_clsid(s: &str) -> bool {
     s.len() == 38 && s.starts_with('{') && s.ends_with('}')
 }
 
-/// Pin keys of every command in `entries` (as [`MenuEntry::from_shell_in`] makes them).
+/// Pin keys of every command and submenu in `entries` (as [`MenuEntry::from_shell_in`] makes
+/// them).
 fn pin_keys(entries: &[ShellMenuEntry], parent: &[&str], out: &mut Vec<String>) {
     for entry in entries {
         match entry {
@@ -606,6 +721,7 @@ fn pin_keys(entries: &[ShellMenuEntry], parent: &[&str], out: &mut Vec<String>) 
             } => {
                 let mut path = parent.to_vec();
                 path.push(label);
+                out.push(pin_key(&path));
                 pin_keys(children, &path, out);
             }
             ShellMenuEntry::Separator => {}

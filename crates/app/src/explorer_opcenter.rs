@@ -156,11 +156,7 @@ impl Explorer {
             .rev()
             .map(|job| Row {
                 id: job.id,
-                icon: match job.verb {
-                    "op.recycle" | "op.delete_permanently" => Icon::Trash,
-                    "op.move" => Icon::Cut,
-                    _ => Icon::Copy,
-                },
+                icon: crate::op_center::op_icon(job.verb),
                 title: job.title(),
                 detail: job.detail(),
                 state: job.state.clone(),
@@ -287,7 +283,9 @@ fn button(
         .id("op-center")
         .debug_selector(|| "op-center".to_owned())
         .a11y_button(tip.clone())
-        .aria_expanded(open)
+        .a11y_open_close(open, cx.entity().downgrade(), |this, _, cx| {
+            this.toggle_ops(cx);
+        })
         .relative()
         .h(theme::h_ctl())
         .min_w(theme::h_ctl())

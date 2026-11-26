@@ -72,9 +72,9 @@ jobs:
         id: version
         shell: bash
         run: bash .github/release-tag.sh
-      # The installers (installer/arke.iss) need Inno Setup 6.6 or later for dark mode.
+      # The installers (installer/arke.iss) need Inno Setup 6.7.4 or later (#406).
       - name: install Inno Setup
-        run: choco install innosetup --version 6.7.1 --no-progress -y
+        uses: ./.github/actions/install-inno-setup
       - name: build
         shell: bash
         env:
@@ -130,10 +130,12 @@ jobs:
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/*.exe
+      # Signs every file Arke downloads (update_sig.rs checks them): only this job sees the key.
       - name: publish
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           CHANNEL: ${{ needs.test.outputs.channel }}
           NUMBER: ${{ needs.test.outputs.number }}
         run: |

@@ -308,6 +308,8 @@ pub(crate) enum PlaceKind {
     Wsl,
     /// Cloud sync folders such as OneDrive (sync roots registered with Windows).
     Cloud,
+    /// A phone or other portable device (`mtp://`, #292).
+    Phone,
 }
 
 /// How cloud files are kept on this machine (`Shell::set_cloud_pin`).
@@ -338,6 +340,15 @@ pub(crate) enum KnownFolder {
 pub(crate) struct ShellMenu {
     pub(crate) session: u64,
     pub(crate) entries: Vec<ShellMenuEntry>,
+    /// Not everything was read: a submenu still filling when the wait ran out, one left to fill
+    /// when it opens, or the item limit. A command missing from it may still be there, so it
+    /// doesn't count as gone (#278).
+    #[serde(default)]
+    pub(crate) partial: bool,
+    /// Submenus left still filling (their `lazy` number, label): not waited for while the menu
+    /// was read, filled right after it (#278).
+    #[serde(default)]
+    pub(crate) filling: Vec<(u32, String)>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -871,12 +882,17 @@ pub(crate) trait Shell: Send + Sync + 'static {
     /// Drags files into another program via Windows drag and drop; returns on drop or cancel with how it ended.
     /// Call on the UI thread while the left button is down (the drag loop needs a thread with a window). No file system access.
     /// `image` is the cursor image from [`Shell::drag_image`]; if it is not ready only the cursor shows.
+    /// `after_lost_press`: another program took the mouse in the middle of Arke's drag (Alt+Tab,
+    /// #326). Arke, now in the background, can't read whether the button is still down, so the
+    /// drag drops only once Windows has seen the button down (otherwise it is cancelled), and
+    /// coming back over Arke doesn't hand it back (Arke's own drag is over).
     fn drag_out(
         &self,
         paths: &[PathBuf],
         image: Option<&DragImage>,
+        after_lost_press: bool,
     ) -> Result<DragOutEnd, ShellError> {
-        let _ = (paths, image);
+        let _ = (paths, image, after_lost_press);
         Ok(DragOutEnd::Finished)
     }
     /// Whether another program's window is on top of `owner` at the cursor, such as a launcher
@@ -1249,6 +1265,28 @@ pub(crate) trait Shell: Send + Sync + 'static {
         let _ = (dir, items);
         CloudScan::default()
     }
+    /// Tells the shell that the pane `slot` shows `visit.dir`, a folder inside a cloud sync root,
+    /// the way File Explorer announces every folder it opens: some sync clients only fill a folder
+    /// with its online-only items once a shell window shows it (#319, `win_folder_visit.rs`). The
+    /// announcement lasts until the next call for the same pane; `None`: the pane left the folder
+    /// (or closed). Names the folder only, nothing is downloaded. Returns at once (the
+    /// announcement runs on its own thread), so it may be called on the UI thread.
+    fn folder_visit(&self, slot: u64, visit: Option<FolderVisit>) {
+        let _ = (slot, visit);
+    }
+}
+
+/// A folder a pane shows, for [`Shell::folder_visit`]. The callbacks run on another thread.
+pub(crate) struct FolderVisit {
+    /// The pane's window (`HWND`); `None` when it has none (tests).
+    pub(crate) window: Option<isize>,
+    pub(crate) dir: PathBuf,
+    /// Something hints that the folder's items changed (a sync client may have added
+    /// placeholders without a watcher event): list it again.
+    pub(crate) changed: Box<dyn Fn() + Send>,
+    /// A "Show in folder" caller that found the announcement selected these items of the folder
+    /// (all of them so far, in order).
+    pub(crate) select: Box<dyn Fn(Vec<Arc<str>>) + Send>,
 }
 
 /// A rendered PDF page.

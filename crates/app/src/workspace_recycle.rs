@@ -20,6 +20,10 @@ pub(super) struct RecyclePage {
     view: Entity<RecycleBin>,
     /// Tab that owns the page.
     pub(super) owner: super::pages::Owner,
+    /// "Open folders in Arke" showed it after ending File Explorer's launcher (#285), with the
+    /// mark's place in order: a File Explorer window on the Recycle Bin that comes anyway shows
+    /// here once (`Workspace::merge_early`). Goes with the page.
+    pub(super) early: Option<u64>,
     _events: Subscription,
 }
 
@@ -53,6 +57,7 @@ impl Workspace {
         self.recycle_page = Some(RecyclePage {
             view,
             owner: self.owner_here(new_tab, cx),
+            early: None,
             _events: events,
         });
         cx.notify();
@@ -134,7 +139,7 @@ impl Workspace {
                 SidebarAction::SetRecyclePinned(false),
             ),
         ];
-        div()
+        let row = div()
             .id("open-recycle")
             .a11y(gpui::Role::TreeItem, t!("recycle.title"))
             .aria_selected(open)
@@ -182,8 +187,20 @@ impl Workspace {
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                     this.open_sidebar_menu(e.position, menu.clone(), cx);
                 }),
-            )
-            .into_any_element()
+            );
+        self.nav_row(
+            row,
+            gpui::SharedString::from("recycle"),
+            open,
+            || super::sidebar_keys::NavRow {
+                depth: 1,
+                expanded: None,
+                open: std::rc::Rc::new(|this, window, cx| this.open_recycle(false, window, cx)),
+                expand: None,
+            },
+            cx,
+        )
+        .into_any_element()
     }
 
     /// Settings changes repaint the workspace, so no notify is needed.

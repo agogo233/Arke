@@ -3,7 +3,8 @@
 //!
 //! - Channels: stable sees stable only; RC sees RC and stable; nightly sees everything. Versions
 //!   compare by SemVer (`0.2.0-nightly.20261110` < `0.2.0-rc.1` < `0.2.0`).
-//! - Downloads go to `%LOCALAPPDATA%\Arke\updates`, verified against `.sha256` when present.
+//! - Downloads go to `%LOCALAPPDATA%\Arke\updates` and are installed only with a valid signature
+//!   from Arke's update key (`update_sig.rs`); the notes shown about an update are signed too.
 //! - Swap: a running exe can be renamed on Windows, so `arke.exe` -> `arke.exe.old` and the new one
 //!   becomes `arke.exe`, rolled back on failure. Then start the new one
 //!   (`--after-update <old pid>`, which waits for this process to exit before taking over
@@ -121,6 +122,10 @@ pub(crate) enum UpdateError {
     /// The download does not match its published SHA-256.
     #[error("{}", t!("update.bad_hash"))]
     BadHash,
+    /// The download has no signature from Arke's update key, or one for another file or version
+    /// (`update_sig.rs`): not installed.
+    #[error("{}", t!("update.bad_signature"))]
+    BadSignature,
     /// The running exe could not be swapped for the new one.
     #[error("{}", t!("update.cannot_replace", error = .0))]
     Replace(#[source] std::io::Error),
@@ -139,6 +144,8 @@ pub(crate) struct Release {
     pub(crate) size: u64,
     /// `.sha256` download URL, if any
     pub(crate) sha_url: Option<String>,
+    /// `.minisig` download URL: the signature the download must have (`update_sig.rs`)
+    pub(crate) sig_url: String,
     /// Release notes (Markdown) and web page
     pub(crate) notes: String,
     pub(crate) page: String,
@@ -223,16 +230,18 @@ fn pick_for(json: &str, channel: Channel, current: &Version, suffix: &str) -> Op
             .find(|a| a["name"].as_str() == Some(&format!("{exe_name}.sha256")))
             .and_then(|a| a["browser_download_url"].as_str())
             .map(str::to_string);
+        let exe_url = exe["browser_download_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let release = Release {
             version: item["tag_name"]
                 .as_str()
                 .unwrap_or_default()
                 .trim_start_matches('v')
                 .to_string(),
-            exe_url: exe["browser_download_url"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            sig_url: format!("{exe_url}.minisig"),
+            exe_url,
             exe_name,
             size: exe["size"].as_u64().unwrap_or(0),
             sha_url,
@@ -254,20 +263,82 @@ pub(crate) fn check(channel: Channel) -> Result<Option<Release>, UpdateError> {
         return Err(UpdateError::NoSource);
     }
     let current = Version::parse(build_info::VERSION).ok_or(UpdateError::BadVersion)?;
-    match crate::win_http::get_text(
+    let found = match routed_text(
         &format!("https://api.github.com/repos/{repo}/releases?per_page=30"),
         &["Accept: application/vnd.github+json"],
     ) {
-        Ok(json) => return Ok(pick(&json, channel, &current)),
+        Ok(json) => pick(&json, channel, &current),
         // The API allows 60 requests an hour per address without signing in, soon used up
         // where many people share one (a school, an office, a café) (#183).
         Err(crate::win_http::HttpError::Status(403 | 429)) => {
             log::info!("update check: GitHub API limit reached, reading the releases feed");
+            let feed = routed_text(&format!("https://github.com/{repo}/releases.atom"), &[])?;
+            pick_from_feed(&feed, repo, channel, &current)
         }
         Err(err) => return Err(err.into()),
+    };
+    Ok(found.map(|release| with_signed_notes(release, repo)))
+}
+
+/// Release asset name of the notes Arke shows about `version` (`cargo xtask publish` signs it).
+fn notes_asset(version: &str) -> String {
+    format!("arke-{version}-notes.md")
+}
+
+/// `release` with the notes from the signed notes file instead of the release's text, which
+/// nothing vouches for; without a valid signature, no notes (the release page is a click away).
+fn with_signed_notes(mut release: Release, repo: &str) -> Release {
+    let asset = notes_asset(&release.version);
+    let url = format!(
+        "https://github.com/{repo}/releases/download/v{}/{asset}",
+        release.version
+    );
+    release.notes = match signed_text(&url, &asset, &release.version) {
+        Ok(notes) => notes,
+        Err(err) => {
+            log::info!("update notes not shown: {err}");
+            String::new()
+        }
+    };
+    release
+}
+
+/// The text at `url` (release asset `asset` of `version`), once its signature (`<url>.minisig`)
+/// checks out. Blocks on the network: background thread.
+pub(crate) fn signed_text(url: &str, asset: &str, version: &str) -> Result<String, UpdateError> {
+    let text = routed_text(url, &[])?;
+    let signature = signature_at(&format!("{url}.minisig"))?;
+    if let Err(err) = crate::update_sig::verify(text.as_bytes(), &signature, asset, version) {
+        log::warn!("{asset}: {err}");
+        return Err(UpdateError::BadSignature);
     }
-    let feed = crate::win_http::get_text(&format!("https://github.com/{repo}/releases.atom"), &[])?;
-    Ok(pick_from_feed(&feed, repo, channel, &current))
+    Ok(text)
+}
+
+/// GETs `url` (a GitHub address) through the update route (`update_route.rs`), or from GitHub
+/// directly when that fails.
+fn routed_text(url: &str, headers: &[&str]) -> Result<String, crate::win_http::HttpError> {
+    crate::update_route::fetch(url, |url, proxy| {
+        crate::win_http::get_text_via(url, headers, proxy)
+    })
+}
+
+/// A `.minisig` file's text; a missing one is an unsigned file.
+fn signature_at(url: &str) -> Result<String, UpdateError> {
+    signature_from(routed_text(url, &[]))
+}
+
+/// [`signature_at`] straight from GitHub.
+fn signature_direct(url: &str) -> Result<String, UpdateError> {
+    signature_from(crate::win_http::get_text(url, &[]))
+}
+
+fn signature_from(got: Result<String, crate::win_http::HttpError>) -> Result<String, UpdateError> {
+    match got {
+        Ok(text) => Ok(text),
+        Err(crate::win_http::HttpError::Status(404)) => Err(UpdateError::BadSignature),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// [`pick`] from the releases feed (`releases.atom`): a web page, not the API, so the API's
@@ -311,6 +382,7 @@ fn pick_from_feed_for(
         let release = Release {
             version: number.to_owned(),
             sha_url: Some(format!("{exe_url}.sha256")),
+            sig_url: format!("{exe_url}.minisig"),
             exe_url,
             exe_name,
             // Not in the feed: the download tells it.
@@ -412,23 +484,54 @@ pub(crate) fn download_to(
             let _ = std::fs::remove_file(path);
         }
     }
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&part)?;
-        crate::win_http::get_resumed(&release.exe_url, &mut file, progress)?;
-    }
+    // Through the route first; a route that hands out something else (a mirror's error page
+    // with status 200) gets one more try straight from GitHub.
+    let mut direct = false;
+    let bytes = loop {
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&part)?;
+            if direct {
+                crate::win_http::get_resumed_via(&release.exe_url, &mut file, progress, None)?;
+            } else {
+                crate::update_route::fetch(&release.exe_url, |url, proxy| {
+                    crate::win_http::get_resumed_via(url, &mut file, progress, proxy)
+                })?;
+            }
+        }
+        // Nothing is installed without Arke's signature for this very file and version.
+        let signature = if direct {
+            signature_direct(&release.sig_url)?
+        } else {
+            signature_at(&release.sig_url)?
+        };
+        let bytes = std::fs::read(&part)?;
+        match crate::update_sig::verify(&bytes, &signature, &release.exe_name, &release.version) {
+            Ok(()) => break bytes,
+            Err(err) => {
+                log::warn!("{}: {err}", release.exe_name);
+                let _ = std::fs::remove_file(&part);
+                match crate::update_route::last() {
+                    Some(crate::update_route::Used::Route(host)) if !direct => {
+                        crate::update_route::fell_back(&host, &err.to_string());
+                        direct = true;
+                    }
+                    _ => return Err(UpdateError::BadSignature),
+                }
+            }
+        }
+    };
     if let Some(sha_url) = &release.sha_url {
-        let expected = crate::win_http::get_text(sha_url, &[])?;
+        let expected = routed_text(sha_url, &[])?;
         let expected = expected
             .split_whitespace()
             .next()
             .unwrap_or_default()
             .to_lowercase();
-        let bytes = std::fs::read(&part)?;
         let actual = Sha256::digest(&bytes)
             .iter()
             .fold(String::new(), |mut s, b| {
@@ -880,12 +983,14 @@ pub(crate) fn release_setup() {
 /// without changing anything, and Arke, still open, says the update didn't happen. Quitting right
 /// away would leave the user with no Arke and nothing to say why.
 fn run_setup(exe: &Path, cx: &mut App) {
+    use crate::update_quiet::Host as _;
     use std::sync::atomic::Ordering;
     if SETUP_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
+    let per_user = crate::update_quiet::RealHost.installs_silently();
     match std::process::Command::new(exe)
-        .args(SETUP_SILENT)
+        .args(setup_flags(per_user))
         .arg(SETUP_LAUNCH)
         .spawn()
     {
@@ -899,6 +1004,22 @@ fn run_setup(exe: &Path, cx: &mut App) {
 
 /// The installer's flags for an update: no wizard, no questions (`installer/arke.iss`).
 pub(crate) const SETUP_SILENT: [&str; 3] = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"];
+/// With [`SETUP_SILENT`] for a per-user install: no RedirectionGuard. Inno Setup would pass it on
+/// to the Arke it starts, which then couldn't open junctions a standard user made (#406), and a
+/// Setup that runs as the user without approval has nothing for it to guard. An all-users install's
+/// Setup runs elevated and keeps it (Inno Setup 6.7.4 doesn't pass it on to the Arke it starts as
+/// the user).
+pub(crate) const SETUP_NO_REDIRECTION_GUARD: &str = "/NOREDIRECTIONGUARD";
+
+/// What [`run_setup`] and a background update pass the installer: [`SETUP_SILENT`], and
+/// [`SETUP_NO_REDIRECTION_GUARD`] when Arke is installed for this user (`per_user`).
+pub(crate) fn setup_flags(per_user: bool) -> Vec<&'static str> {
+    let mut flags = SETUP_SILENT.to_vec();
+    if per_user {
+        flags.push(SETUP_NO_REDIRECTION_GUARD);
+    }
+    flags
+}
 /// The installer starts Arke again when it is done, with the tabs that were open.
 pub(crate) const SETUP_LAUNCH: &str = "/LAUNCH";
 /// With [`SETUP_LAUNCH`]: in the background instead, no window (`--background`).
@@ -1080,6 +1201,24 @@ mod tests {
     }
 
     #[test]
+    fn per_user_updates_turn_redirection_guard_off() {
+        assert_eq!(
+            setup_flags(true),
+            [
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/NOREDIRECTIONGUARD"
+            ]
+        );
+        // An all-users install's Setup runs elevated: it keeps the protection.
+        assert_eq!(
+            setup_flags(false),
+            ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+        );
+    }
+
+    #[test]
     fn versions_order_like_semver() {
         assert!(v("0.2.0-nightly.20261110") < v("0.2.0-nightly.20261111"));
         assert!(v("0.2.0-nightly.20261111") < v("0.2.0-rc.1"));
@@ -1186,6 +1325,7 @@ mod tests {
             exe_name: String::new(),
             size: 0,
             sha_url: None,
+            sig_url: String::new(),
             notes: String::new(),
             page: String::new(),
         };
@@ -1265,6 +1405,55 @@ mod tests {
         let sha = crate::win_http::get_text(latest.sha_url.as_deref().unwrap(), &[]).unwrap();
         assert_eq!(sha.split_whitespace().next().map(str::len), Some(64));
         assert!(latest.notes.starts_with("### ") && latest.notes.contains("\n\n### "));
+    }
+
+    /// #249 against the real releases, through an HTTP proxy as the download route
+    /// (`ARKE_TEST_PROXY=127.0.0.1:18080`): the 0.8.1 installer comes through the route whole.
+    /// 0.8.1 predates update signatures, so its `.sha256` stands in for them here.
+    #[test]
+    #[ignore = "network"]
+    fn live_download_through_a_proxy() {
+        let proxy = std::env::var("ARKE_TEST_PROXY").expect("ARKE_TEST_PROXY=host:port");
+        crate::update_route::set(&proxy);
+        let url = "https://github.com/Koimsurai/Arke/releases/download/v0.8.1/arke-0.8.1-setup.exe";
+        let path = std::env::temp_dir().join(format!("arke-live-route-{}.exe", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        crate::update_route::fetch(url, |url, proxy| {
+            crate::win_http::get_resumed_via(url, &mut file, &mut |_, _| true, proxy)
+        })
+        .unwrap();
+        drop(file);
+        let used = crate::update_route::last();
+        assert!(
+            matches!(&used, Some(crate::update_route::Used::Route(_))),
+            "{used:?}"
+        );
+        let sha = crate::update_route::fetch(&format!("{url}.sha256"), |url, proxy| {
+            crate::win_http::get_text_via(url, &[], proxy)
+        })
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        crate::update_route::set("");
+        let actual = Sha256::digest(&bytes)
+            .iter()
+            .fold(String::new(), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+        assert_eq!(
+            sha.split_whitespace().next().map(str::to_ascii_lowercase),
+            Some(actual),
+            "{} bytes",
+            bytes.len()
+        );
     }
 
     #[test]

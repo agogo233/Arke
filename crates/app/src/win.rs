@@ -378,6 +378,21 @@ pub(crate) fn double_click_time() -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(if ms == 0 { 500 } else { ms }))
 }
 
+/// Whether the mouse message being handled was made by Windows from a finger or a pen (it marks
+/// those with a signature in the message's extra info), not by a mouse or touchpad. Single-click
+/// mode selects what the pointer rests on; a finger or a pen hovering over the screen isn't
+/// pointing at anything, so it doesn't (#46). Only meaningful while a mouse event is handled.
+pub(crate) fn pointer_is_touch_or_pen() -> bool {
+    const SIGNATURE_MASK: isize = 0xFFFF_FF00;
+    const MI_WP_SIGNATURE: isize = 0xFF51_5700;
+    if cfg!(test) {
+        return false;
+    }
+    // SAFETY: no arguments; reads the current thread's last message's extra info.
+    let extra = unsafe { windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo() }.0;
+    extra & SIGNATURE_MASK == MI_WP_SIGNATURE
+}
+
 /// How long the pointer must rest on an item to select it in single-click mode (Settings >
 /// Mouse; `SPI_GETMOUSEHOVERTIME`, 400 ms by default). Reads one system parameter, fine on the
 /// UI thread.
@@ -900,8 +915,9 @@ impl Shell for WinShell {
         &self,
         paths: &[PathBuf],
         image: Option<&crate::shell::DragImage>,
+        after_lost_press: bool,
     ) -> Result<crate::shell::DragOutEnd, ShellError> {
-        win_fileops::drag_out(paths, image).map(|outcome| match outcome {
+        win_fileops::drag_out(paths, image, after_lost_press).map(|outcome| match outcome {
             Some(win_fileops::DragOutcome::Returned) => crate::shell::DragOutEnd::Returned,
             _ => crate::shell::DragOutEnd::Finished,
         })
@@ -1654,6 +1670,10 @@ impl Shell for WinShell {
         crate::win_cloud::scan(dir, items)
     }
 
+    fn folder_visit(&self, slot: u64, visit: Option<crate::shell::FolderVisit>) {
+        crate::win_folder_visit::visit(slot, visit);
+    }
+
     fn decode_ansi(&self, bytes: &[u8]) -> String {
         use windows::Win32::Globalization::{
             CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar,
@@ -2400,7 +2420,7 @@ fn reg_key_exists(root: windows::Win32::System::Registry::HKEY, key: &str) -> bo
 }
 
 /// A `REG_DWORD` value, or `None`.
-fn read_reg_dword(
+pub(crate) fn read_reg_dword(
     root: windows::Win32::System::Registry::HKEY,
     key: &str,
     value: &str,

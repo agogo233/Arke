@@ -55,6 +55,8 @@ pub(crate) mod groups;
 mod icons;
 #[path = "explorer_layout.rs"]
 mod layout;
+#[path = "explorer_localized.rs"]
+mod localized_names;
 #[path = "explorer_markdown.rs"]
 mod markdown_view;
 #[path = "explorer_marquee.rs"]
@@ -71,8 +73,14 @@ mod preview;
 pub(crate) mod scope;
 #[path = "explorer_shelf.rs"]
 mod shelf_ops;
+#[path = "explorer_similar.rs"]
+pub(crate) mod similar;
 #[path = "explorer_sizes.rs"]
 mod sizes;
+#[path = "explorer_sortopts.rs"]
+mod sortopts;
+#[path = "explorer_toolbar.rs"]
+mod toolbar;
 #[path = "explorer_topbar.rs"]
 mod top_bar;
 #[path = "explorer_tree.rs"]
@@ -90,7 +98,9 @@ pub(crate) use dnd::{
 };
 pub(crate) use icons::IconSize;
 pub(crate) use layout::{SharedPreview, shared_preview};
-pub(crate) use menu::{app_name, menu_open_with_found, open_with_list, set_open_with};
+pub(crate) use menu::{
+    app_name, menu_open_with_found, open_with_list, pin_is_submenu, set_open_with,
+};
 #[cfg(test)]
 pub(crate) use preview::PreviewBody;
 pub(crate) use top_bar::TitleLayout;
@@ -280,6 +290,9 @@ pub(crate) enum ErrorAction {
     /// Run this file operation again: the items of a failed one that are worth retrying (a
     /// program had them open, say).
     RetryOp(Box<crate::shell::FileOp>),
+    /// Open this archive with the app Windows has for it: Arke can't read how it is compressed
+    /// (#341).
+    OpenDefault(PathBuf),
 }
 
 #[derive(Clone)]
@@ -381,8 +394,31 @@ pub(crate) enum AppEvent {
         version: u64,
         scan: crate::shell::CloudScan,
     },
+    /// The shell hints that the items of this folder changed (`explorer_cloud.rs`).
+    CloudFolderHint(PathBuf),
+    /// Listing the folder shown as `generation` (at `version`) again finished; `changed`: items
+    /// came or went.
+    CloudRechecked {
+        dir: PathBuf,
+        generation: Gen,
+        version: u64,
+        changed: bool,
+    },
+    /// A "Show in folder" caller selected these items of `dir` through the shell's window list
+    /// (`win_folder_visit.rs`).
+    ShellSelected {
+        dir: PathBuf,
+        names: Vec<Arc<str>>,
+    },
     /// The Windows context menu ("Show more options" and pinned commands).
     ShellMenu(menu::ShellMenuEvent),
+}
+
+/// A text box of this pane the keyboard is in (F6, `workspace_sidebar_keys.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypingIn {
+    PathBar,
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -430,6 +466,8 @@ pub(crate) enum ExplorerEvent {
     },
     /// Needs a login for this network location (Workspace opens the dialog).
     NetLogin(PathBuf),
+    /// Extracting an archive needs its password (Workspace asks, then calls `extract_archive`).
+    ArchivePassword(crate::archive_password::PasswordAsk),
     /// Moved to another folder (recorded in Recent).
     /// Arrived at a folder; `stepped` when the history recorded a step back to where it was.
     /// `kind` is how it got there (a history menu jump moves the timeline only once it lands).
@@ -442,6 +480,8 @@ pub(crate) enum ExplorerEvent {
     BackToHome {
         start: bool,
     },
+    /// Home picked from the path bar's drive menu: the workspace shows the Home page.
+    OpenHome,
     /// An operation changed this remote folder (servers send no change notifications; panes
     /// showing it relist).
     RemoteChanged(PathBuf),
@@ -459,6 +499,12 @@ pub(crate) enum ExplorerEvent {
     /// F2 with nothing to rename in the list while a drive or network place is open: the
     /// workspace renames that place if it can be renamed.
     RenamePlace(PathBuf),
+    /// Right-click on a folder of the path bar: the workspace shows the folder's menu, the same
+    /// one as in the sidebar (a drive's has its rows and Properties too) (#257).
+    FolderMenu {
+        path: PathBuf,
+        position: gpui::Point<Pixels>,
+    },
 }
 
 /// Where this `Explorer` sits in its tab. Set by `Workspace` before every render.
@@ -529,6 +575,8 @@ struct PendingNav {
     folder_view: folder_view::PendingView,
     /// Opened from Home: `Some(start)`, where `start` says Home was where the tab started.
     from_home: Option<bool>,
+    /// Arriving starts the history over (the drive the folder was on is gone).
+    fresh: bool,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -540,6 +588,9 @@ pub(crate) struct Metrics {
     pub(crate) clock: StartClock,
     /// First frame, timed by `clock`.
     pub(crate) clock_first_frame: Option<Duration>,
+    /// The listing the first frame waited for. A listing of another one (the window started on
+    /// Home, and a folder was opened minutes later) isn't the start's (#343).
+    timed_listing: Option<Gen>,
 }
 
 /// How a pane's first frame and first full listing are logged. A window hands its timing to the
@@ -641,6 +692,8 @@ pub(crate) struct Explorer {
     folder_view: folder_view::State,
     /// Show extensions; show thumbnails in grid (settings).
     pub(crate) show_extensions: bool,
+    /// Folders' localized names in this listing (#370).
+    pub(crate) localized: localized_names::LocalizedNames,
     /// Checkboxes next to items (settings).
     pub(crate) show_checkboxes: bool,
     /// Column widths were dragged but not saved yet (saved on release).
@@ -662,6 +715,8 @@ pub(crate) struct Explorer {
     /// Group details view by sort column (settings), plus the computed sections.
     pub(crate) group_rows: bool,
     group_cache: groups::GroupCache,
+    /// Labels of the collapsed sections of the folder on show (#287); not saved.
+    collapsed_groups: std::collections::HashSet<SharedString>,
     pub(crate) show_thumbnails: bool,
     /// Read images and exe icons on network locations too (settings, off by default).
     pub(crate) network_thumbnails: bool,
@@ -706,6 +761,8 @@ pub(crate) struct Explorer {
     path_slot: path_bar::SlotWidth,
     /// The title row's search box width and the press-to-drag on the path bar.
     top_row: top_bar::TopRow,
+    /// The pane row's buttons from the keyboard (F6).
+    toolbar: toolbar::ToolbarKeys,
     filter_input: Entity<TextInput>,
     /// Filter box text, excluding uncommitted IME composition.
     pub(crate) query: String,
@@ -739,10 +796,24 @@ pub(crate) struct Explorer {
     /// instead of the folder shown. Cleared when search mode ends.
     search_in: Option<PathBuf>,
     pub(crate) search_results: Option<SearchResults>,
+    /// The order a header click chose for the results (#55); `None` keeps the relevance order.
+    /// Ends with search mode.
+    pub(crate) search_sort: Option<arke_core::SearchSort>,
+    /// The hits of `search_results` in relevance order, kept while `search_sort` reorders them
+    /// (a click back to relevance doesn't search again).
+    search_relevance: Option<Arc<Vec<Arc<arke_core::SearchHit>>>>,
     /// Deleted or moved away since the walk started: the walk doesn't watch for changes, so
     /// hits at or below these are left out of every result until the next fresh walk.
     search_gone: Vec<PathBuf>,
     pub(crate) search_cursor: Option<usize>,
+    /// "Similar results" (#396) were opened for this query text; another text closes them.
+    similar_open: Option<String>,
+    /// Nothing in the subfolders matched this query text as typed, so the walk lists similar
+    /// names instead (#396).
+    similar_fallback: Option<String>,
+    /// The keyboard cursor is on the "Similar results" row (`search_cursor` is then `None`: the
+    /// row isn't a hit).
+    similar_focus: bool,
     /// Search scope is the whole PC (`search_mode` is also true; results come from the index).
     search_global: bool,
     /// Whole-PC query: serial (stale results are dropped), background task, and index size at the
@@ -768,6 +839,10 @@ pub(crate) struct Explorer {
     view_options_open: bool,
     /// The view options flyout was just closed and is fading out.
     pub(crate) closing_view_options: Option<crate::motion::Leaving<()>>,
+    /// The sort flyout is open (`explorer_sortopts.rs`).
+    sort_options_open: bool,
+    /// The sort flyout was just closed and is fading out.
+    pub(crate) closing_sort_options: Option<crate::motion::Leaving<()>>,
     /// Its icon size slider is being dragged.
     icon_slider_drag: std::rc::Rc<std::cell::Cell<bool>>,
     /// Display scale at the last render, for thumbnail decode sizes.
@@ -781,6 +856,9 @@ pub(crate) struct Explorer {
     owner: Option<isize>,
     pub(crate) renaming: Option<ops::Renaming>,
     pub(crate) context_menu: Option<menu::ContextMenu>,
+    /// The menu for a right press on an item, made on the press so the Windows menu is read
+    /// while the button is still down; shown on release (#278).
+    pub(crate) early_menu: Option<menu::EarlyMenu>,
     /// A dismissed context menu fading out (drawn inert, see `motion::Leaving`).
     pub(crate) closing_menu: Option<crate::motion::Leaving<menu::ContextMenu>>,
     pub(crate) extract_job: Option<menu::ExtractJob>,
@@ -1042,6 +1120,7 @@ impl Explorer {
                 folder_views.read(cx),
             ),
             show_extensions: settings.read(cx).settings.show_extensions,
+            localized: localized_names::LocalizedNames::default(),
             show_checkboxes: settings.read(cx).settings.show_checkboxes,
             column_resized: false,
             preview_resized: false,
@@ -1053,6 +1132,7 @@ impl Explorer {
             right_press: None,
             group_rows: settings.read(cx).settings.group_rows,
             group_cache: groups::GroupCache::default(),
+            collapsed_groups: std::collections::HashSet::new(),
             show_thumbnails: settings.read(cx).settings.show_thumbnails,
             network_thumbnails: settings.read(cx).settings.network_thumbnails,
             place_names: settings.read(cx).settings.place_names.clone(),
@@ -1079,6 +1159,7 @@ impl Explorer {
             path_bounds: path_bar::PathBounds::default(),
             path_slot: path_bar::SlotWidth::default(),
             top_row: top_bar::TopRow::default(),
+            toolbar: toolbar::ToolbarKeys::new(cx.focus_handle()),
             filter_input,
             query: String::new(),
             filtered: None,
@@ -1096,8 +1177,13 @@ impl Explorer {
             search_root: None,
             search_in: None,
             search_results: None,
+            search_sort: None,
+            search_relevance: None,
             search_gone: Vec::new(),
             search_cursor: None,
+            similar_open: None,
+            similar_fallback: None,
+            similar_focus: false,
             search_global: false,
             global_serial: 0,
             global_task: None,
@@ -1117,6 +1203,8 @@ impl Explorer {
             zoom_accum: 0.,
             view_options_open: false,
             closing_view_options: None,
+            sort_options_open: false,
+            closing_sort_options: None,
             icon_slider_drag: std::rc::Rc::default(),
             ui_scale: 1.,
             tree: tree::Tree::new(settings.read(cx).settings.details_tree),
@@ -1125,6 +1213,7 @@ impl Explorer {
             owner: Self::owner_from(window),
             renaming: None,
             context_menu: None,
+            early_menu: None,
             closing_menu: None,
             extract_job: None,
             rename_when_appears: None,
@@ -1162,7 +1251,7 @@ impl Explorer {
             parent_column: None,
             preview_gen: 0,
             zoom: preview::Zoom::default(),
-            pdf_cache: preview::PdfCache::default(),
+            pdf_cache: preview::PdfCache,
             screen: (
                 gpui::size(
                     crate::theme::scaled_px(1280.),
@@ -1432,7 +1521,7 @@ impl Explorer {
         let generation = self.dir_service.navigate(
             path.clone(),
             ListOptions {
-                sort: self.sort,
+                sort: self.list_sort(),
                 show_hidden: self.show_hidden,
                 watch: true,
             },
@@ -1453,6 +1542,7 @@ impl Explorer {
             // Filter and search belong to the old folder, and so does a folder comparison.
             self.reset_filter(cx);
             self.compare = None;
+            self.reset_collapsed_groups();
 
             // So does Quick Look: left open, it would pop up again over the new folder.
             self.close_quick_look(cx);
@@ -1464,6 +1554,7 @@ impl Explorer {
             select,
             folder_view,
             from_home: None,
+            fresh: false,
         });
         self.typeahead.reset();
         self.loading_task = Some(cx.spawn(async move |this, cx| {
@@ -1491,6 +1582,7 @@ impl Explorer {
         match action {
             ErrorAction::Retry(path) => self.retry(path, cx),
             ErrorAction::RetryOp(op) => self.retry_op(*op, cx),
+            ErrorAction::OpenDefault(path) => self.open_file(path, cx),
             ErrorAction::Login(path) => {
                 // Arke's own dialog (opened by Workspace) asks for credentials and reopens this tab
                 // on success.
@@ -1660,6 +1752,15 @@ impl Explorer {
     pub(crate) const fn opened_from_home(&mut self, start: bool) {
         if let Some(pending) = self.pending.as_mut() {
             pending.from_home = Some(start);
+        }
+    }
+
+    /// The drive this pane was on is gone: opens `home` with nothing of the old folder left, no
+    /// way back to it in the history.
+    pub(crate) fn leave_removed_drive(&mut self, home: PathBuf, cx: &mut Context<Self>) {
+        self.navigate_unlocked(home, NavKind::New, cx);
+        if let Some(pending) = self.pending.as_mut() {
+            pending.fresh = true;
         }
     }
 
@@ -1844,6 +1945,7 @@ impl Explorer {
                 // The first places of a window: Quick Access pins from File Explorer (#45).
                 crate::quick_access::refresh(&self.services.shell, places.clone(), cx);
                 self.places = places;
+                self.folder_view_on_places(cx);
                 cx.notify();
             }
             AppEvent::DiskSpace(spaces) => {
@@ -1887,6 +1989,16 @@ impl Explorer {
             AppEvent::Io(event) => self.handle_io(event, cx),
             AppEvent::CloudScan { dir, version, scan } => {
                 self.handle_cloud_scan(dir, version, scan, cx);
+            }
+            AppEvent::CloudFolderHint(dir) => self.cloud_folder_hint(&dir),
+            AppEvent::CloudRechecked {
+                dir,
+                generation,
+                version,
+                changed,
+            } => self.cloud_rechecked(&dir, generation, version, changed, cx),
+            AppEvent::ShellSelected { dir, names } => {
+                self.select_in_folder(&dir, names, cx);
             }
             AppEvent::Search(results) => self.handle_search(results, cx),
             AppEvent::ClipboardSet {
@@ -1977,6 +2089,11 @@ impl Explorer {
                 if complete {
                     self.last_timing = Some(timing);
                     if self.metrics.first_listing.is_none() {
+                        if self.metrics.first_frame.is_some()
+                            && self.metrics.timed_listing != Some(generation)
+                        {
+                            self.metrics.clock = StartClock::Untimed;
+                        }
                         self.metrics.listing_ready = true;
                     }
                     // Full content replaced: drop selections that no longer exist (nested tree
@@ -2024,9 +2141,10 @@ impl Explorer {
     fn apply_folder_delta(
         &mut self,
         generation: Gen,
-        delta: arke_core::Delta,
+        mut delta: arke_core::Delta,
         cx: &mut Context<Self>,
     ) {
+        self.keep_localized_names(&mut delta);
         // A merge is running: this one follows it, in order.
         if let Some(merge) = self
             .delta_merge
@@ -2217,10 +2335,16 @@ impl Explorer {
     fn commit_navigation(&mut self, pending: PendingNav, path: &Path, sorted_by: SortSpec) -> bool {
         self.failed = None;
         let previous = self.model.as_ref().map(|m| m.path.clone());
-        let stepped =
-            pending.kind == NavKind::New && previous.as_deref().is_some_and(|p| p != path);
+        let stepped = pending.kind == NavKind::New
+            && !pending.fresh
+            && previous.as_deref().is_some_and(|p| p != path);
         let depth_before = self.history.depth();
-        self.history.commit(pending.kind, previous.as_deref(), path);
+        if pending.fresh {
+            self.history = History::default();
+            self.from_home = None;
+        } else {
+            self.history.commit(pending.kind, previous.as_deref(), path);
+        }
         if let Some(start) = pending.from_home {
             self.from_home = Some((self.history.depth(), start));
         } else if pending.kind == NavKind::New
@@ -2295,6 +2419,21 @@ impl Explorer {
         self.remember_folder_view(cx);
     }
 
+    /// The order the list is kept in: the chosen sort, plus the date sections while the list is
+    /// grouped by a date with folders kept apart, so folders go into their date's section (#286).
+    pub(crate) fn list_sort(&self) -> SortSpec {
+        let grouped = self.group_rows && self.view_mode != ViewMode::Columns;
+        let spec = SortSpec {
+            sections: grouped.then(|| groups::day_buckets(self.services.shell.as_ref())),
+            ..self.sort
+        };
+        if spec.date_sections().is_some() {
+            spec
+        } else {
+            self.sort
+        }
+    }
+
     /// Shows the list in `sort` without recording it anywhere (defaults, remembered views).
     fn apply_sort(&mut self, sort: SortSpec, cx: &mut Context<Self>) {
         self.sort = sort;
@@ -2324,9 +2463,10 @@ impl Explorer {
             .sort
             .uses(SortColumn::Type)
             .then(arke_core::format::type_names_version);
-        let key = (model.generation, model.version, self.sort, want, want_type);
+        let list_sort = self.list_sort();
+        let key = (model.generation, model.version, list_sort, want, want_type);
         // Column and direction already match; only folder sizes (or type names) are out of date.
-        let only_sizes = model.sorted_by == self.sort;
+        let only_sizes = model.sorted_by == list_sort;
         if (only_sizes && have == want && self.type_order == want_type)
             || self.sort_inflight == Some(key)
         {
@@ -2348,7 +2488,7 @@ impl Explorer {
             // name order): that sorts once now with the sizes known so far.
             return;
         }
-        let spec = self.sort;
+        let spec = list_sort;
         let sizes = want.map(|_| self.folder_sizes.snapshot());
         let (generation, version) = (model.generation, model.version);
         if only_sizes && model.entries.len() <= INLINE_SORT_MAX {
@@ -2369,7 +2509,7 @@ impl Explorer {
                 if let Some(model) = this.model.as_ref()
                     && model.generation == generation
                     && model.version == version
-                    && this.sort == spec
+                    && this.list_sort() == spec
                 {
                     this.apply_sorted(sorted, spec, want, want_type, cx);
                     // The user changed the sort: keep the selected item on screen. Don't scroll
@@ -2531,6 +2671,11 @@ impl Explorer {
                 }
             }
             InputEvent::Confirm => {
+                // On "Similar results": opens or closes them.
+                if self.search_mode && self.similar_focused() {
+                    self.toggle_similar(cx);
+                    return;
+                }
                 // Enter opens the item under the cursor, or the first one if there's no cursor.
                 let ix = if self.search_mode {
                     self.search_cursor
@@ -2615,6 +2760,8 @@ impl Explorer {
             self.search_root = None;
             self.search_in = None;
             self.search_results = None;
+            self.search_sort = None;
+            self.search_relevance = None;
             self.search_gone.clear();
             self.search_cursor = None;
             // Back to "this folder": the next search starts with subfolders.
@@ -2651,16 +2798,18 @@ impl Explorer {
             return;
         };
         let key = (root.clone(), self.show_hidden);
+        // Names as typed first; similar ones once asked for (#396, `explorer_similar.rs`).
+        let query = self.search_query();
         if self.search_root.as_ref() == Some(&key) {
-            self.search.set_query(&self.query, crate::win::clock());
+            self.search.set_parsed(query);
         } else {
-            self.search
-                .start(root, self.show_hidden, &self.query, crate::win::clock());
+            self.search.start_parsed(root, self.show_hidden, query);
             self.search_root = Some(key);
             self.search_gone.clear();
         }
         self.search_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.search_cursor = None;
+        self.similar_focus = false;
     }
 
     fn handle_search(&mut self, results: SearchResults, cx: &mut Context<Self>) {
@@ -2670,15 +2819,83 @@ impl Explorer {
         {
             return;
         }
+        if self.fall_back_to_similar(&results) {
+            self.search_results = None;
+            self.search_cursor = None;
+            cx.notify();
+            return;
+        }
         let results = self.without_gone(results);
+        let results = self.arrange_results(results);
         let len = results.hits.len();
         self.search_cursor = match self.search_cursor {
             _ if len == 0 => None,
             Some(ix) => Some(ix.min(len - 1)),
+            // On "Similar results" (just opened): it stays there.
+            None if self.similar_focused() => None,
             None => Some(0),
         };
         self.search_results = Some(results);
         cx.notify();
+    }
+
+    /// Fresh results in the order the header chose (they arrive in relevance order). Sorting a
+    /// few thousand hits takes about a millisecond, and only happens once a header was clicked.
+    pub(super) fn arrange_results(&mut self, mut results: SearchResults) -> SearchResults {
+        self.search_relevance = None;
+        if let Some(sort) = self.search_sort {
+            self.search_relevance = Some(Arc::clone(&results.hits));
+            results.hits = Arc::new(similar::sort_hits(&results.hits, results.similar, sort));
+        }
+        results
+    }
+
+    /// A search results header was clicked: sort by that column, flip it, or (a third click) go
+    /// back to relevance. The results on screen are reordered without searching again, and the
+    /// cursor stays on its hit.
+    pub(super) fn click_search_header(
+        &mut self,
+        column: arke_core::SearchColumn,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_sort = arke_core::SearchSort::after_click(self.search_sort, column);
+        let Some(results) = self.search_results.as_mut() else {
+            cx.notify();
+            return;
+        };
+        let at = self
+            .search_cursor
+            .and_then(|ix| results.hits.get(ix).cloned());
+        let relevance = self
+            .search_relevance
+            .take()
+            .unwrap_or_else(|| Arc::clone(&results.hits));
+        match self.search_sort {
+            Some(sort) => {
+                results.hits = Arc::new(similar::sort_hits(&relevance, results.similar, sort));
+                self.search_relevance = Some(relevance);
+            }
+            None => results.hits = relevance,
+        }
+        if let Some(hit) = at
+            && let Some(ix) = results.hits.iter().position(|h| Arc::ptr_eq(h, &hit))
+        {
+            self.search_cursor = Some(ix);
+            let row = self.search_row_of(ix);
+            self.search_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        } else {
+            self.search_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// Whether the hit (below `root`) was deleted or moved away.
+    fn hit_gone(&self, root: &Path, hit: &arke_core::SearchHit) -> bool {
+        let path = root.join(&*hit.rel);
+        self.search_gone
+            .iter()
+            .any(|g| arke_core::path::is_same_or_inside(&path, g))
     }
 
     /// `results` without hits that were deleted or moved away (see `search_gone`).
@@ -2686,13 +2903,14 @@ impl Explorer {
         if self.search_gone.is_empty() {
             return results;
         }
-        let gone = |hit: &arke_core::SearchHit| {
-            let path = results.root.join(&*hit.rel);
-            self.search_gone
-                .iter()
-                .any(|g| arke_core::path::is_same_or_inside(&path, g))
-        };
+        let gone = |hit: &arke_core::SearchHit| self.hit_gone(&results.root, hit);
         if results.hits.iter().any(|hit| gone(hit)) {
+            // The similar ones stay last and counted apart.
+            let split = results.hits.len().saturating_sub(results.similar);
+            results.similar = results.hits[split..]
+                .iter()
+                .filter(|hit| !gone(hit))
+                .count();
             let kept: Vec<_> = results
                 .hits
                 .iter()
@@ -2717,6 +2935,15 @@ impl Explorer {
         self.search_gone.extend(removed.iter().cloned());
         if let Some(results) = self.search_results.take() {
             let results = self.without_gone(results);
+            // The relevance order loses them too.
+            if let Some(relevance) = self.search_relevance.take() {
+                let kept: Vec<_> = relevance
+                    .iter()
+                    .filter(|hit| !self.hit_gone(&results.root, hit))
+                    .cloned()
+                    .collect();
+                self.search_relevance = Some(Arc::new(kept));
+            }
             let len = results.hits.len();
             self.search_cursor = self
                 .search_cursor
@@ -2790,6 +3017,10 @@ impl Explorer {
     /// Down in the filter box: focus the list and select the first item (or keep the cursor).
     fn filter_to_list(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.list_focus, cx);
+        if self.search_mode && self.similar_focused() {
+            cx.notify();
+            return;
+        }
         let ix = if self.search_mode {
             self.search_cursor
         } else {
@@ -2834,9 +3065,13 @@ impl Explorer {
         let ix = ix.min(len - 1);
         if self.search_mode {
             self.search_cursor = Some(ix);
+            self.similar_focus = false;
+            let row = self.search_row_of(ix);
             self.search_scroll
-                .scroll_to_item(ix, ScrollStrategy::Nearest);
+                .scroll_to_item(row, ScrollStrategy::Nearest);
         } else if let Some(view) = self.view() {
+            // Arrow keys never land in a collapsed section; type to select and the like open it.
+            self.reveal_item(ix);
             self.selection.select_only(&view, ix);
             self.cursor = Some(ix);
             self.scroll_to_cursor = None;
@@ -2860,6 +3095,7 @@ impl Explorer {
         }
         let ix = ix.min(view.len() - 1);
         self.selection.extend_to(&view, ix, false);
+        self.drop_hidden_selection();
         self.cursor = Some(ix);
         self.scroll_to_index(ix, ScrollStrategy::Nearest);
         cx.notify();
@@ -2883,7 +3119,7 @@ impl Explorer {
     }
 
     /// The user picked a view mode: show it and remember it for this folder.
-    fn pick_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+    pub(crate) fn pick_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         if self.view_mode == mode {
             return;
         }
@@ -2898,6 +3134,8 @@ impl Explorer {
             return;
         }
         self.view_mode = mode;
+        // Grouped by a date, folders go into the date sections only outside column view.
+        self.ensure_sorted(cx);
         self.recenter_grid |= mode == ViewMode::Icons;
         if mode != ViewMode::Details {
             self.tree_clear();
@@ -2983,7 +3221,10 @@ impl Explorer {
         self.preview_pane = settings.preview_pane;
         self.show_extensions = settings.show_extensions;
         self.show_checkboxes = settings.show_checkboxes;
-        self.group_rows = settings.group_rows;
+        if self.group_rows != settings.group_rows {
+            self.group_rows = settings.group_rows;
+            self.ensure_sorted(cx);
+        }
         self.show_thumbnails = settings.show_thumbnails;
         self.network_thumbnails = settings.network_thumbnails;
         self.place_names = settings.place_names.clone();
@@ -3006,10 +3247,10 @@ impl Explorer {
             let follow_sort = match policy {
                 DefaultsPolicy::Follow => true,
                 DefaultsPolicy::FollowUnchanged => self.sort.same_order(&old_sort),
-                DefaultsPolicy::Keep => false,
+                DefaultsPolicy::Keep | DefaultsPolicy::KeepSort => false,
             };
             let follow_view = match policy {
-                DefaultsPolicy::Follow => true,
+                DefaultsPolicy::Follow | DefaultsPolicy::KeepSort => true,
                 DefaultsPolicy::FollowUnchanged => self.view_mode == old_view,
                 DefaultsPolicy::Keep => false,
             };
@@ -3056,7 +3297,22 @@ impl Explorer {
         ((height / self.row_height()).floor() as usize).max(1)
     }
 
+    /// Where `step` goes, skipping the items of collapsed sections.
     fn target(&self, step: Step, window: &Window) -> usize {
+        let to = self.target_unchecked(step, window);
+        if self.collapsed_groups.is_empty() || self.search_mode {
+            return to;
+        }
+        let forward = matches!(
+            step,
+            Step::Next | Step::Right | Step::PageDown | Step::First
+        );
+        self.skip_collapsed(to, forward)
+            .or_else(|| self.skip_collapsed(to, !forward))
+            .unwrap_or_else(|| self.current_cursor().unwrap_or(0))
+    }
+
+    fn target_unchecked(&self, step: Step, window: &Window) -> usize {
         let cur = self.current_cursor();
         // Grid view: up/down moves a whole row; page moves a screen of rows.
         let (stride, page) = if self.grid_active() {
@@ -3094,39 +3350,56 @@ impl Explorer {
     }
 
     fn select_prev(&mut self, _: &SelectPrev, w: &mut Window, cx: &mut Context<Self>) {
+        if self.search_move(Step::Prev, w, cx) {
+            return;
+        }
         self.select_index(self.target(Step::Prev, w), cx);
     }
     fn select_next(&mut self, _: &SelectNext, w: &mut Window, cx: &mut Context<Self>) {
+        if self.search_move(Step::Next, w, cx) {
+            return;
+        }
         self.select_index(self.target(Step::Next, w), cx);
     }
     fn select_page_up(&mut self, _: &SelectPageUp, w: &mut Window, cx: &mut Context<Self>) {
-        if self.turn_pdf_page(preview::PageTurn::Prev, cx) {
+        if self.turn_pdf_page(preview::PageTurn::Prev, cx) || self.search_move(Step::PageUp, w, cx)
+        {
             return;
         }
         self.select_index(self.target(Step::PageUp, w), cx);
     }
     fn select_page_down(&mut self, _: &SelectPageDown, w: &mut Window, cx: &mut Context<Self>) {
-        if self.turn_pdf_page(preview::PageTurn::Next, cx) {
+        if self.turn_pdf_page(preview::PageTurn::Next, cx)
+            || self.search_move(Step::PageDown, w, cx)
+        {
             return;
         }
         self.select_index(self.target(Step::PageDown, w), cx);
     }
     fn select_first(&mut self, _: &SelectFirst, w: &mut Window, cx: &mut Context<Self>) {
-        if self.turn_pdf_page(preview::PageTurn::First, cx) {
+        if self.turn_pdf_page(preview::PageTurn::First, cx) || self.search_move(Step::First, w, cx)
+        {
             return;
         }
         self.select_index(self.target(Step::First, w), cx);
     }
     fn select_last(&mut self, _: &SelectLast, w: &mut Window, cx: &mut Context<Self>) {
-        if self.turn_pdf_page(preview::PageTurn::Last, cx) {
+        if self.turn_pdf_page(preview::PageTurn::Last, cx) || self.search_move(Step::Last, w, cx) {
             return;
         }
         self.select_index(self.target(Step::Last, w), cx);
     }
     fn extend_prev(&mut self, _: &ExtendPrev, w: &mut Window, cx: &mut Context<Self>) {
+        // Search results take one item at a time: Shift moves like the plain key.
+        if self.search_move(Step::Prev, w, cx) {
+            return;
+        }
         self.extend_index(self.target(Step::Prev, w), cx);
     }
     fn extend_next(&mut self, _: &ExtendNext, w: &mut Window, cx: &mut Context<Self>) {
+        if self.search_move(Step::Next, w, cx) {
+            return;
+        }
         self.extend_index(self.target(Step::Next, w), cx);
     }
     fn extend_page_up(&mut self, _: &ExtendPageUp, w: &mut Window, cx: &mut Context<Self>) {
@@ -3148,6 +3421,7 @@ impl Explorer {
         }
         if let Some(view) = self.view() {
             self.selection.select_all(&view);
+            self.drop_hidden_selection();
             cx.notify();
         }
     }
@@ -3161,7 +3435,7 @@ impl Explorer {
 
     /// Esc: clears the filter first, then the selection.
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.close_view_options(cx) {
+        if self.close_view_options(cx) || self.close_sort_options(cx) {
             return;
         }
         if self.quick_look {
@@ -3178,6 +3452,11 @@ impl Explorer {
     }
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        // "Similar results" isn't an item: Enter opens or closes them.
+        if self.search_mode && self.similar_focused() {
+            self.toggle_similar(cx);
+            return;
+        }
         if let Some(ix) = self.current_cursor() {
             self.open_index(ix, cx);
         }
@@ -3314,6 +3593,7 @@ impl Explorer {
         }
         if self.search_mode {
             self.search_cursor = Some(ix);
+            self.similar_focus = false;
         } else if let Some(view) = self.view() {
             let in_selection = view
                 .get(ix)
@@ -3321,6 +3601,7 @@ impl Explorer {
             self.click_select = None;
             if m.shift {
                 self.selection.extend_to(&view, ix, m.control);
+                self.drop_hidden_selection();
             } else if m.control {
                 // Ctrl+double-click opens a folder in a new tab: its second click leaves the item
                 // selected, whether the first one selected it or (already selected) unselected it.
@@ -3343,7 +3624,13 @@ impl Explorer {
         // open again here: the second click would land on whatever is under the cursor in the new
         // folder.
         if event.click_count >= 2 && !m.control && !m.shift && !crate::prefs::single_click() {
-            self.open_index(ix, cx);
+            if m.alt {
+                // Alt+double-click: Properties of the selection it is in, as in File Explorer
+                // (#337).
+                self.open_properties(self.menu_targets(), cx);
+            } else {
+                self.open_index(ix, cx);
+            }
         }
         // Ctrl+double-click on a folder: a new tab, in the background; with Shift too, in front, as
         // Ctrl+click on a link in a browser (#291). Ctrl+click alone selects, as in File Explorer.
@@ -3399,7 +3686,7 @@ impl Explorer {
 
     /// Single-click mode (point to select, as in File Explorer): the pointer moved over item `ix`.
     /// Starts the hover timer unless the item already waits for it or the move is a drag, a
-    /// press or a modifier chord (#46).
+    /// press, a modifier chord, or a finger or pen (#46).
     pub(super) fn on_row_pointer_move(
         &mut self,
         ix: usize,
@@ -3408,7 +3695,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         let m = event.modifiers;
-        if !crate::prefs::single_click()
+        if !crate::prefs::point_to_select()
             || event.pressed_button.is_some()
             || m.control
             || m.shift
@@ -3418,6 +3705,7 @@ impl Explorer {
             || self.renaming.is_some()
             || self.marquee.is_some()
             || cx.has_active_drag()
+            || crate::win::pointer_is_touch_or_pen()
         {
             // Not a resting pointer: whatever was pending is off.
             self.hover_pick = None;
@@ -3462,7 +3750,7 @@ impl Explorer {
     /// and list can change while the timer runs.
     fn pick_hovered(&mut self, ix: usize, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let m = window.modifiers();
-        if !crate::prefs::single_click()
+        if !crate::prefs::point_to_select()
             || m.control
             || m.shift
             || m.alt
@@ -3548,6 +3836,11 @@ impl Explorer {
         if text.is_empty() || text.chars().any(char::is_control) {
             return;
         }
+        if text == " " && self.search_mode && self.similar_focused() {
+            self.toggle_similar(cx);
+            cx.stop_propagation();
+            return;
+        }
         if text == " " && !self.typeahead.is_typing(Instant::now()) {
             self.space_preview(cx);
             cx.stop_propagation();
@@ -3594,6 +3887,22 @@ impl Explorer {
 
     /// Click elsewhere (empty title bar, sidebar): end path editing without navigating, and release
     /// filter box focus back to the list, same as clicking the content. The filter text stays.
+    /// The path bar or the search box, when the keyboard is in one of them.
+    pub(crate) fn typing_in(&self, window: &Window, cx: &App) -> Option<TypingIn> {
+        if self.editing_path && self.path_input.read(cx).focus_handle(cx).is_focused(window) {
+            Some(TypingIn::PathBar)
+        } else if self
+            .filter_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+        {
+            Some(TypingIn::Search)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn cancel_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_path {
             self.stop_edit_path(window, cx);
@@ -3718,6 +4027,11 @@ impl Explorer {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         if self.metrics.first_frame.is_none() {
             self.metrics.first_frame = Some(since_start);
+            self.metrics.timed_listing = self
+                .pending
+                .as_ref()
+                .map(|p| p.generation)
+                .or_else(|| self.model.as_ref().map(|m| m.generation));
             if let StartClock::Cold(at) | StartClock::Request(at) = self.metrics.clock {
                 self.metrics.clock_first_frame = Some(at.elapsed());
             }

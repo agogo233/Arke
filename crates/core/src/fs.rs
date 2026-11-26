@@ -62,6 +62,14 @@ pub trait Fs: Send + Sync + 'static {
     fn read_dir(&self, path: &Path) -> io::Result<DirIter>;
     /// Stats a single entry without following symlinks.
     fn stat(&self, path: &Path) -> io::Result<Entry>;
+    /// The name `path`'s item has in its folder, when it differs from the last part of `path`: a
+    /// change notification can name an item in another case than it now has (renamed to only
+    /// change the case) or by its short 8.3 name, and the item is found either way (#310).
+    /// `None` when it is the same, or unknown.
+    fn listed_name(&self, path: &Path) -> Option<String> {
+        let _ = path;
+        None
+    }
     /// Watches a directory (non-recursive). Dropping the returned value stops watching.
     fn watch(&self, path: &Path, on_event: WatchCallback) -> io::Result<Box<dyn Send>>;
     /// Reads a whole file (for thumbnails). Errors without reading if larger than `max_len`.
@@ -135,6 +143,19 @@ pub fn is_network_path(path: &Path) -> bool {
     }
 }
 
+/// Replaces `path` with `bytes` so that it is always either the old file or the whole new one:
+/// written to `tmp`, flushed to the disk, then renamed over `path`. Without the flush a power cut
+/// right after the rename can leave `path` full of zeros (the rename reaches the disk before the
+/// data does), which for settings.json meant losing every setting. Background threads only.
+pub fn replace_file(path: &Path, tmp: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(bytes.as_ref())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, path)
+}
+
 /// Panics (debug builds) on file system calls from the UI thread.
 #[track_caller]
 pub(crate) fn debug_assert_not_ui_thread(op: &str, path: &Path) {
@@ -178,6 +199,14 @@ impl Fs for RealFs {
             .file_name()
             .map_or_default(|n| n.to_string_lossy().into_owned());
         Ok(Entry::from_metadata(&name, &meta))
+    }
+
+    #[cfg(windows)]
+    fn listed_name(&self, path: &Path) -> Option<String> {
+        debug_assert_not_ui_thread("listed_name", path);
+        let listed = crate::winfs::listed_name(path)?;
+        (path.file_name() != Some(listed.as_os_str()))
+            .then(|| listed.to_string_lossy().into_owned())
     }
 
     fn read(&self, path: &Path, max_len: u64) -> io::Result<Vec<u8>> {
@@ -418,5 +447,26 @@ mod tests {
         }
         drop(watch);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::*;
+
+    /// The new content replaces the old whole, and the temporary file doesn't stay behind.
+    #[test]
+    fn a_replaced_file_has_the_new_content_and_no_temporary_file_is_left() {
+        let dir = std::env::temp_dir().join(format!("arke-test-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let tmp = dir.join("settings.json.tmp");
+        std::fs::write(&path, "old").unwrap();
+        replace_file(&path, &tmp, "new content").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+        assert!(!tmp.exists());
+        replace_file(&path, &tmp, b"bytes too").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"bytes too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

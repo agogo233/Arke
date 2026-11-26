@@ -12,7 +12,11 @@
 //!   walking (changing them rewalks), the name text goes to nucleo. With `content:`, files that
 //!   pass the filters are read by a few worker threads ([`crate::content`]) and only matches are
 //!   added, each with its first matching line.
+//! - The name text matches as [`Query::names`] says (#396): exact searches use substring terms;
+//!   [`NameMatch::Similar`] matches fuzzily and lists the exact matches first, the others after
+//!   them ([`SearchResults::similar`]). Switching between them only reparses, no rewalk.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +31,7 @@ use crate::entry::{Entry, EntryKind};
 use crate::filter::entry_accepted;
 use crate::fs::Fs;
 use crate::index::IndexedTree;
-use crate::index_query::{Clock, Query};
+use crate::index_query::{Clock, NameMatch, Query, exact_text, fuzzy_text};
 use crate::service::Gen;
 
 /// Maximum hits sent to the UI (top by score).
@@ -76,6 +80,9 @@ pub struct SearchResults {
     pub contents: bool,
     /// Files whose contents were read so far.
     pub read: u64,
+    /// Hits at the end of `hits` that only match fuzzily, after the exact ones (with
+    /// [`NameMatch::Similar`]; 0 otherwise).
+    pub similar: usize,
 }
 
 /// Receives result snapshots on the coordinator thread.
@@ -105,10 +112,20 @@ enum Cmd {
 pub struct SearchService {
     cmd: flume::Sender<Cmd>,
     generation: AtomicU64,
+    /// What the coordinator thread takes, until the first search starts it: each tab has a
+    /// search, and most tabs never search.
+    unstarted: parking_lot::Mutex<Option<Unstarted>>,
+}
+
+struct Unstarted {
+    fs: Arc<dyn Fs>,
+    sink: SearchSink,
+    index: Option<TreeSource>,
+    rx: flume::Receiver<Cmd>,
 }
 
 impl SearchService {
-    /// Spawns the coordinator thread; nothing is walked until [`Self::start`].
+    /// A search with no thread yet; the first [`Self::start`] starts it.
     pub fn new(fs: Arc<dyn Fs>, sink: SearchSink) -> Self {
         Self::with_index(fs, sink, None)
     }
@@ -117,16 +134,35 @@ impl SearchService {
     /// folder's items from it instead of walking the share.
     pub fn with_index(fs: Arc<dyn Fs>, sink: SearchSink, index: Option<TreeSource>) -> Self {
         let (cmd, rx) = flume::unbounded();
-        let wake_tx = cmd.downgrade();
+        Self {
+            cmd,
+            generation: AtomicU64::new(0),
+            unstarted: parking_lot::Mutex::new(Some(Unstarted {
+                fs,
+                sink,
+                index,
+                rx,
+            })),
+        }
+    }
+
+    /// Starts the coordinator thread, the first time. Commands sent before wait in its channel.
+    fn run(&self) {
+        let Some(Unstarted {
+            fs,
+            sink,
+            index,
+            rx,
+        }) = self.unstarted.lock().take()
+        else {
+            return;
+        };
+        let wake_tx = self.cmd.downgrade();
         let spawned = std::thread::Builder::new()
             .name("search".into())
             .spawn(move || coordinator(&fs, index, &sink, &rx, &wake_tx));
         if let Err(err) = spawned {
             log::error!("failed to spawn search thread: {err}");
-        }
-        Self {
-            cmd,
-            generation: AtomicU64::new(0),
         }
     }
 
@@ -142,12 +178,18 @@ impl SearchService {
     /// Starts a new search from `root` (fresh walk). `clock` is for date filters. Returns
     /// immediately.
     pub fn start(&self, root: PathBuf, show_hidden: bool, query: &str, clock: Clock) -> Gen {
+        self.start_parsed(root, show_hidden, Query::parse(query, clock))
+    }
+
+    /// [`Self::start`] with a parsed query (to choose how names match, [`Query::names`]).
+    pub fn start_parsed(&self, root: PathBuf, show_hidden: bool, query: Query) -> Gen {
+        self.run();
         let generation = self.next_gen();
         let _ = self.cmd.send(Cmd::Start {
             generation,
             root,
             show_hidden,
-            query: Query::parse(query, clock),
+            query,
         });
         generation
     }
@@ -155,17 +197,27 @@ impl SearchService {
     /// Changes the query. Reuses walked items when only the name text changed; new filters
     /// rewalk. Returns immediately.
     pub fn set_query(&self, query: &str, clock: Clock) -> Gen {
+        self.set_parsed(Query::parse(query, clock))
+    }
+
+    /// [`Self::set_query`] with a parsed query. A new [`Query::names`] alone only reparses.
+    pub fn set_parsed(&self, query: Query) -> Gen {
         let generation = self.next_gen();
-        let _ = self.cmd.send(Cmd::Query {
-            generation,
-            query: Query::parse(query, clock),
-        });
+        if self.unstarted.lock().is_some() {
+            // No search ran yet: nothing to change.
+            return generation;
+        }
+        let _ = self.cmd.send(Cmd::Query { generation, query });
         generation
     }
 
     /// Stops walking and matching; results already sent become stale.
     pub fn stop(&self) {
         self.next_gen();
+        if self.unstarted.lock().is_some() {
+            // No search ran yet: nothing to stop.
+            return;
+        }
         let _ = self.cmd.send(Cmd::Stop);
     }
 }
@@ -292,11 +344,14 @@ impl Coordinator {
                 }
                 if let Some(nucleo) = self.nucleo.as_mut() {
                     // Only appended to the previous text: nucleo can refine the last results.
-                    let (old, new) = (&a.query.text, &query.text);
-                    let append = !old.is_empty()
-                        && new.starts_with(old.as_str())
-                        && is_path_query(new) == is_path_query(old);
-                    reparse(nucleo, new, append);
+                    {
+                        let (old, new) = (pattern_text(&a.query), pattern_text(&query));
+                        let append = !old.is_empty()
+                            && a.query.names == query.names
+                            && new.starts_with(&*old)
+                            && is_path_query(&new) == is_path_query(&old);
+                        reparse(nucleo, &new, append);
+                    }
                     a.query = query;
                     a.generation = generation;
                     self.dirty = true;
@@ -325,7 +380,7 @@ impl Coordinator {
             Nucleo::new(Config::DEFAULT.match_paths(), notify, None, COLUMNS)
         });
         nucleo.restart(true);
-        reparse(nucleo, &query.text, false);
+        reparse(nucleo, &pattern_text(&query), false);
         let walk = spawn_walk(
             Arc::clone(&self.fs),
             WalkSpec {
@@ -381,6 +436,37 @@ fn is_path_query(query: &str) -> bool {
     query.contains(['\\', '/'])
 }
 
+/// What nucleo matches for the query's name text, as [`Query::names`] says.
+fn pattern_text(query: &Query) -> Cow<'_, str> {
+    match query.names {
+        NameMatch::Any => Cow::Borrowed(&query.text),
+        NameMatch::Exact => Cow::Owned(exact_text(&query.text)),
+        NameMatch::Similar => Cow::Owned(fuzzy_text(&query.text)),
+    }
+}
+
+/// `hits` (in score order) with the exact matches of `text` first, then the others, and how many
+/// the others are.
+fn exact_first(hits: Vec<Arc<SearchHit>>, text: &str) -> (Vec<Arc<SearchHit>>, usize) {
+    let path = is_path_query(text);
+    let pattern = nucleo::pattern::Pattern::parse(
+        &exact_text(text),
+        CaseMatching::Smart,
+        Normalization::Smart,
+    );
+    let mut matcher = nucleo::Matcher::new(Config::DEFAULT.match_paths());
+    let mut buf = Vec::new();
+    let (mut exact, similar): (Vec<_>, Vec<_>) = hits.into_iter().partition(|hit| {
+        let haystack: &str = if path { &hit.rel } else { &hit.entry.name };
+        pattern
+            .score(nucleo::Utf32Str::new(haystack, &mut buf), &mut matcher)
+            .is_some()
+    });
+    let count = similar.len();
+    exact.extend(similar);
+    (exact, count)
+}
+
 fn reparse(nucleo: &mut Nucleo<Arc<SearchHit>>, query: &str, append: bool) {
     let (active, inactive) = if is_path_query(query) {
         (COL_PATH, COL_NAME)
@@ -424,6 +510,12 @@ fn snapshot(nucleo: &Nucleo<Arc<SearchHit>>, a: &Active, searching: bool) -> Sea
         }
         (hits, matched)
     };
+    let similar_wanted = a.query.names == NameMatch::Similar && !a.query.text.trim().is_empty();
+    let (hits, similar) = if similar_wanted {
+        exact_first(hits, &a.query.text)
+    } else {
+        (hits, 0)
+    };
     let p = &a.walk.progress;
     SearchResults {
         generation: a.generation,
@@ -436,6 +528,7 @@ fn snapshot(nucleo: &Nucleo<Arc<SearchHit>>, a: &Active, searching: bool) -> Sea
         truncated: p.truncated.load(Ordering::Relaxed),
         contents: a.query.content_needle().is_some(),
         read: p.read.load(Ordering::Relaxed),
+        similar,
     }
 }
 
@@ -826,6 +919,75 @@ mod tests {
         // Blank query shows nothing.
         let g = svc.set_query("", Clock::default());
         assert!(settle(&rx, g).hits.is_empty());
+    }
+
+    /// #396: an exact search lists the names as typed; a similar one lists them first and the
+    /// fuzzy matches after them, counted in `similar`. Switching only reparses, no rewalk.
+    #[test]
+    fn exact_search_then_similar_ones_after_it() {
+        let fs = FakeFs::new();
+        fs.insert_dir(r"C:\v", vec![dir("tools"), file("vacation_list_drive.txt")]);
+        fs.insert_dir(
+            r"C:\v\tools",
+            vec![file("validrive.exe"), file("other.txt")],
+        );
+        let (sink, rx) = collect();
+        let svc = SearchService::new(Arc::clone(&fs) as Arc<dyn Fs>, sink);
+        let query = |text: &str, names: NameMatch| Query {
+            names,
+            ..Query::parse(text, Clock::default())
+        };
+        let g = svc.start_parsed(
+            PathBuf::from(r"C:\v"),
+            false,
+            query("validrive", NameMatch::Exact),
+        );
+        let r = settle(&rx, g);
+        assert_eq!(rels(&r), [r"tools\validrive.exe"]);
+        assert_eq!((r.similar, r.matched), (0, 1));
+        let listed = fs.read_dir_calls();
+
+        let g = svc.set_parsed(query("validrive", NameMatch::Similar));
+        let r = settle(&rx, g);
+        assert_eq!(
+            rels(&r),
+            [r"tools\validrive.exe", "vacation_list_drive.txt"]
+        );
+        assert_eq!(r.similar, 1);
+        // Back to exact.
+        let g = svc.set_parsed(query("validrive", NameMatch::Exact));
+        assert_eq!(rels(&settle(&rx, g)), [r"tools\validrive.exe"]);
+        assert_eq!(fs.read_dir_calls(), listed, "no rewalk");
+
+        // Short terms are substrings for both: nothing similar. A path query matches the path.
+        let g = svc.set_parsed(query("va", NameMatch::Similar));
+        let r = settle(&rx, g);
+        assert_eq!(r.similar, 0, "{:?}", rels(&r));
+        let g = svc.set_parsed(query(r"tls\valid", NameMatch::Exact));
+        assert!(settle(&rx, g).hits.is_empty());
+        let g = svc.set_parsed(query(r"tls\valid", NameMatch::Similar));
+        let r = settle(&rx, g);
+        assert_eq!(
+            (rels(&r), r.similar),
+            (vec![r"tools\validrive.exe".to_owned()], 1)
+        );
+    }
+
+    /// A tab that never searches has no search thread, and what it is told before its first search
+    /// (stop on leaving a folder, a query) queues nothing.
+    #[test]
+    fn no_thread_until_the_first_search() {
+        let fs = FakeFs::new();
+        fs.insert_dir(r"C:\p", vec![file("notes.md")]);
+        let (sink, rx) = collect();
+        let svc = SearchService::new(fs, sink);
+        svc.stop();
+        svc.set_query("notes", Clock::default());
+        assert!(svc.unstarted.lock().is_some(), "no thread yet");
+        assert!(svc.cmd.is_empty(), "nothing queued");
+        let g = svc.start(PathBuf::from(r"C:\p"), false, "notes", Clock::default());
+        assert!(svc.unstarted.lock().is_none());
+        assert_eq!(rels(&settle(&rx, g)), ["notes.md"]);
     }
 
     /// The point of the design: a permanently hung folder under the root (dead network drive)
