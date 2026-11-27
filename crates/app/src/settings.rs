@@ -666,6 +666,8 @@ pub(crate) struct Settings {
     pub(crate) queue_same_drive: bool,
     /// Read copies back and compare them with their sources.
     pub(crate) verify_copies: bool,
+    /// Replace existing files when extracting an archive.
+    pub(crate) overwrite_on_extract: bool,
     /// Hand copies and moves to TeraCopy (offered only when it is installed).
     pub(crate) use_teracopy: bool,
     /// Double click on empty list space goes up one level.
@@ -858,6 +860,7 @@ impl Default for Settings {
             warn_extension_change: true,
             queue_same_drive: true,
             verify_copies: false,
+            overwrite_on_extract: false,
             use_teracopy: false,
             double_click_up: false,
             folder_sizes: true,

@@ -7,8 +7,8 @@
 //!    converts names to the ANSI code page: names that don't fit are skipped by `-x` and crash
 //!    re-encoding, and older builds lack RAR5, xz and zstd. Used only when the DLL is missing.
 //!
-//! Either way the entries go through the same checks as zip and tar (safe paths, no overwrite,
-//! links skipped).
+//! Either way the entries go through the same checks as zip and tar (safe paths, links skipped,
+//! overwrite only when the reader can check for a password first).
 
 use super::{ArchiveError, ArchiveKind, ArchiveListing, ExtractOptions, ExtractSummary};
 use std::path::Path;
@@ -49,6 +49,22 @@ pub(super) fn extract(
             return super::libarchive::extract(api, kind, archive, dest, opts);
         }
         if let Some(tar) = super::bsdtar::tar_exe() {
+            if opts.overwrite {
+                // tar.exe reports encryption only after it has written files. Never replace a
+                // user's file through it; tell the caller why the names were left alone.
+                let safe = ExtractOptions {
+                    cancel: opts.cancel,
+                    progress: opts.progress,
+                    decode_legacy: opts.decode_legacy,
+                    password: opts.password,
+                    overwrite: false,
+                };
+                let mut summary = super::bsdtar::extract(&tar, kind, archive, dest, &safe)?;
+                if summary.skipped_existing > 0 {
+                    summary.overwrite_skipped = true;
+                }
+                return Ok(summary);
+            }
             return super::bsdtar::extract(&tar, kind, archive, dest, opts);
         }
     }

@@ -2,7 +2,7 @@
 //!
 //! tar.exe is used only as a decoder: `tar.exe --format pax -cf - @-` reads the archive from stdin
 //! and writes every entry back out as a pax tar on stdout, which the tar crate reads with the same
-//! checks as a plain `.tar` (safe paths, no overwrite, links skipped). Letting tar.exe extract
+//! checks as a plain `.tar` (safe paths, links skipped, no overwrite). Letting tar.exe extract
 //! itself (`-x -k`) was rejected: it can't skip links, and it reports neither skipped existing files
 //! nor what it refused except as ANSI text on stderr.
 //!

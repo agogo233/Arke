@@ -2749,6 +2749,11 @@ impl Explorer {
             progress: ExtractProgress::default(),
         });
         self.notice = None;
+        // Read on the UI thread: the worker below has no access to the app context.
+        let overwrite = crate::settings::SettingsStore::global(cx)
+            .read(cx)
+            .settings
+            .overwrite_on_extract;
         let shell = Arc::clone(&self.services.shell);
         let tx = self.events_tx.clone();
         spawn_thread("extract", move || {
@@ -2776,6 +2781,7 @@ impl Explorer {
                     progress: &progress,
                     decode_legacy: &decode,
                     password: password.as_deref(),
+                    overwrite,
                 },
             );
             drop(password);
@@ -2962,6 +2968,15 @@ impl Explorer {
                 } else {
                     tn!("extract.done", count).into_owned()
                 };
+                if s.overwritten > 0 {
+                    msg.push_str(&tn!(
+                        "extract.overwritten",
+                        usize::try_from(s.overwritten).unwrap_or(usize::MAX)
+                    ));
+                }
+                if s.overwrite_skipped {
+                    msg.push_str(&t!("extract.overwrite_skipped"));
+                }
                 if s.skipped_existing > 0 {
                     msg.push_str(&tn!(
                         "extract.skipped_existing",
@@ -2975,7 +2990,12 @@ impl Explorer {
                     ));
                 }
                 // A clean, complete run is in the operation center only (#266).
-                if s.cancelled || s.skipped_existing > 0 || s.skipped_unsafe > 0 {
+                if s.cancelled
+                    || s.overwritten > 0
+                    || s.overwrite_skipped
+                    || s.skipped_existing > 0
+                    || s.skipped_unsafe > 0
+                {
                     self.notice = Some(msg);
                 }
                 if let Some(folder) = folder {

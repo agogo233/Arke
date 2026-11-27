@@ -13,7 +13,7 @@
 use super::{
     ArchiveError, ArchiveItem, ArchiveKind, ArchiveListing, ExtractOptions, ExtractProgress,
     ExtractSummary, SystemReaderError, cancelled, display_name, rar_volumes, safe_relative_path,
-    write_new_file,
+    safe_target, write_new_file,
 };
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fs;
@@ -417,6 +417,23 @@ pub(super) fn extract(
     opts: &ExtractOptions<'_>,
 ) -> Result<ExtractSummary, ArchiveError> {
     let volumes = volumes_for(kind, archive);
+    // Encryption is reported per entry. Check it before writing so asking for a password never
+    // happens after an existing file has already been replaced. A probe respects cancellation:
+    // multi-volume archives can take a while just to walk their headers.
+    if opts.overwrite {
+        let mut probe = Reader::open(api, kind, &volumes, opts.decode_legacy)?;
+        while let Some(header) = probe.next(kind)? {
+            if cancelled(opts) {
+                return Ok(ExtractSummary {
+                    cancelled: true,
+                    ..ExtractSummary::default()
+                });
+            }
+            if header.encrypted {
+                return Err(ArchiveError::Encrypted);
+            }
+        }
+    }
     let total = volumes
         .iter()
         .filter_map(|p| fs::metadata(p).ok())
@@ -440,7 +457,10 @@ pub(super) fn extract(
             summary.skipped_unsafe += 1;
             continue;
         };
-        let target = dest.join(&rel);
+        let Some(target) = safe_target(dest, &rel) else {
+            summary.skipped_unsafe += 1;
+            continue;
+        };
         match header.kind {
             EntryType::Dir => {
                 fs::create_dir_all(&target).map_err(|source| ArchiveError::Create {
@@ -458,7 +478,8 @@ pub(super) fn extract(
                     progress.done = position.load(Ordering::Relaxed).min(total);
                     (opts.progress)(progress);
                 };
-                write_new_file(&target, &mut reader, None, &mut on_bytes, opts)?
+                let expected = opts.overwrite.then_some(header.size);
+                write_new_file(&target, &mut reader, expected, &mut on_bytes, opts)?
                     .count(&mut summary);
                 progress.files = summary.files;
             }

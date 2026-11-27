@@ -5778,6 +5778,26 @@ fn extract_zip_from_context_menu(cx: &mut TestAppContext) {
         std::fs::read_to_string(sandbox.join("readme.txt")).unwrap(),
         "user"
     );
+
+    // With overwrite on, the same extraction replaces the user's file.
+    cx.update(|_, cx| {
+        crate::settings::SettingsStore::global(cx).update(cx, |s, cx| {
+            s.update(|st| st.overwrite_on_extract = true, cx)
+        });
+    });
+    let overwritten = before_mark(&t!("extract.overwritten_other", count = MARK));
+    right_click(&view, cx, Some(0));
+    run_command(&view, cx, MenuCommand::ExtractHere);
+    wait_until(cx, &view, "overwrite here", |v| {
+        v.extract_job.is_none()
+            && v.notice
+                .as_deref()
+                .is_some_and(|n| n.contains(overwritten.as_str()))
+    });
+    assert_eq!(
+        std::fs::read_to_string(sandbox.join("readme.txt")).unwrap(),
+        "two"
+    );
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 

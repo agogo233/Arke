@@ -6,7 +6,7 @@
 
 use super::{
     ArchiveError, ArchiveItem, ArchiveListing, ExtractOptions, ExtractProgress, ExtractSummary,
-    Written, cancelled, display_name, safe_relative_path, write_new_file,
+    Written, cancelled, display_name, safe_relative_path, safe_target, write_new_file,
 };
 use sevenz_rust2::{Archive, ArchiveEntry, ArchiveReader, EntryDecision, Password};
 use std::fs::{self, File};
@@ -68,7 +68,7 @@ pub(super) fn list(
     Ok(listing)
 }
 
-/// Extracts a 7z with the shared rules (safe paths, never overwrite, links skipped).
+/// Extracts a 7z with the shared rules (safe paths, links skipped, overwrite when asked).
 pub(super) fn extract(
     file: File,
     dest: &Path,
@@ -116,7 +116,12 @@ pub(super) fn extract(
             (opts.progress)(progress);
             return Ok(EntryDecision::Continue);
         };
-        let target = dest.join(&rel);
+        let Some(target) = safe_target(dest, &rel) else {
+            summary.skipped_unsafe += 1;
+            progress.done = progress.done.saturating_add(entry.size);
+            (opts.progress)(progress);
+            return Ok(EntryDecision::Continue);
+        };
         if entry.is_directory {
             if let Err(source) = fs::create_dir_all(&target) {
                 failure = Some(ArchiveError::Create {
@@ -132,9 +137,15 @@ pub(super) fn extract(
             progress.done = progress.done.saturating_add(n);
             (opts.progress)(progress);
         };
-        match write_new_file(&target, data, None, &mut on_bytes, opts) {
+        let expected = opts.overwrite.then_some(entry.size);
+        match write_new_file(&target, data, expected, &mut on_bytes, opts) {
             Ok(Written::Done) => {
                 summary.files += 1;
+                progress.files = summary.files;
+            }
+            Ok(Written::Overwritten) => {
+                summary.files += 1;
+                summary.overwritten += 1;
                 progress.files = summary.files;
             }
             // Stops at the check below.

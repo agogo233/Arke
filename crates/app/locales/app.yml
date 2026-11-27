@@ -6044,6 +6044,30 @@ extract.skipped_existing_other:
   es: ", %{count} archivos existentes omitidos"
   pt-BR: ", %{count} arquivos existentes ignorados"
   ja: "、既存の %{count} 個のファイルをスキップしました"
+extract.overwritten_one:
+  en: ", replaced 1 existing file"
+  zh-TW: "，已取代 %{count} 個已存在的檔案"
+  zh-CN: "，已替换 %{count} 个已存在的文件"
+  de: ", 1 vorhandene Datei ersetzt"
+  es: ", 1 archivo existente reemplazado"
+  pt-BR: ", 1 arquivo existente substituído"
+  ja: "、既存の 1 個のファイルを置き換えました"
+extract.overwritten_other:
+  en: ", replaced %{count} existing files"
+  zh-TW: "，已取代 %{count} 個已存在的檔案"
+  zh-CN: "，已替换 %{count} 个已存在的文件"
+  de: ", %{count} vorhandene Dateien ersetzt"
+  es: ", %{count} archivos existentes reemplazados"
+  pt-BR: ", %{count} arquivos existentes substituídos"
+  ja: "、既存の %{count} 個のファイルを置き換えました"
+extract.overwrite_skipped:
+  en: " Same names were kept: this format can't check for a password before writing."
+  zh-TW: " 已保留同名檔案：此格式無法在寫入前檢查密碼。"
+  zh-CN: " 已保留同名文件：此格式无法在写入前检查密码。"
+  de: " Gleichnamige Dateien wurden behalten: dieses Format kann vor dem Schreiben nicht nach einem Passwort fragen."
+  es: " Se conservaron los archivos con el mismo nombre: este formato no puede comprobar la contraseña antes de escribir."
+  pt-BR: " Os arquivos com o mesmo nome foram mantidos: este formato não pode verificar a senha antes de gravar."
+  ja: " 同名のファイルは保持されました。この形式では書き込み前にパスワードを確認できません。"
 extract.skipped_unsafe_one:
   en: ", skipped 1 unsafe or unsupported item"
   zh-TW: "，略過 %{count} 個不安全或不支援的項目"
@@ -8531,6 +8555,14 @@ settings.group_file_ops:
   es: Copiar y mover
   pt-BR: Copiar e mover
   ja: コピーと移動
+settings.group_archives:
+  en: "Archives"
+  zh-TW: "壓縮與解壓縮"
+  zh-CN: "压缩和解压"
+  de: Archive
+  es: Archivos comprimidos
+  pt-BR: Arquivos compactados
+  ja: アーカイブ
 settings.queue_same_drive:
   en: "One job at a time per drive"
   zh-TW: "同一個磁碟一次只做一項工作"
@@ -8563,6 +8595,22 @@ settings.verify_copies_desc:
   es: Vuelve a leer cada copia y la compara con el original. Tarda más.
   pt-BR: Lê cada cópia de volta e compara com o original. Demora mais.
   ja: 各コピーを読み戻して元のファイルと比較します。時間がかかります。
+settings.overwrite_on_extract:
+  en: "Replace files when extracting"
+  zh-TW: "解壓縮時取代同名檔案"
+  zh-CN: "解压时替换同名文件"
+  de: "Dateien beim Extrahieren ersetzen"
+  es: "Reemplazar archivos al extraer"
+  pt-BR: "Substituir arquivos ao extrair"
+  ja: "展開時にファイルを置き換える"
+settings.overwrite_on_extract_desc:
+  en: "Existing files with the same name are replaced. Off by default, so a second extraction leaves them alone."
+  zh-TW: "同名檔案會被取代。預設關閉，因此再次解壓縮會保留原檔。"
+  zh-CN: "同名文件会被替换。默认关闭，再次解压会保留原文件。"
+  de: "Vorhandene Dateien mit demselben Namen werden ersetzt. Standardmäßig aus; eine zweite Extraktion lässt sie unangetastet."
+  es: "Los archivos existentes con el mismo nombre se reemplazan. Desactivado por defecto: una segunda extracción los respeta."
+  pt-BR: "Arquivos existentes com o mesmo nome são substituídos. Desativado por padrão; uma segunda extração os preserva."
+  ja: "同名の既存ファイルを置き換えます。既定ではオフなので、再展開では元のファイルを保持します。"
 settings.use_teracopy:
   en: "Use TeraCopy for copy and move"
   zh-TW: "用 TeraCopy 複製和移動"

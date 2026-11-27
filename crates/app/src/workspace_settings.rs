@@ -1830,6 +1830,7 @@ impl Workspace {
             ],
         );
         files.push(group(Some(t!("settings.group_file_ops")), file_ops_rows(s)));
+        files.push(group(Some(t!("settings.group_archives")), archive_rows(s)));
         let sorting = regroup(
             sorting,
             &[
@@ -2261,6 +2262,18 @@ fn file_ops_rows(s: &crate::settings::Settings) -> Vec<AnyElement> {
         ));
     }
     rows
+}
+
+/// Archives: what to do with files already in the destination folder.
+fn archive_rows(s: &crate::settings::Settings) -> Vec<AnyElement> {
+    vec![card(
+        Icon::Copy,
+        t!("settings.overwrite_on_extract"),
+        Some(t!("settings.overwrite_on_extract_desc")),
+        switch("overwrite-on-extract", s.overwrite_on_extract, |st| {
+            st.overwrite_on_extract = !st.overwrite_on_extract;
+        }),
+    )]
 }
 
 /// A settings group: small heading, one box, hairlines between rows, as in Windows 11 Settings.

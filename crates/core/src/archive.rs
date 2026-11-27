@@ -3,13 +3,16 @@
 //!
 //! No RAR decoder is linked: the UnRAR license isn't AGPL-compatible, and libarchive's own RAR
 //! reader is only used as the copy Windows ships (archiveint.dll, or tar.exe on older systems).
-//! Every format's entries go through the same `safe_relative_path` and `write_new_file` below, so
-//! the rules are the same for all of them.
+//! Every format's entries go through the same `safe_relative_path`, `safe_target` and
+//! `write_new_file` below, so the rules are the same for all of them.
 //!
 //! Safety rules:
 //! - Every entry path is rechecked: absolute paths, `..` and drive letters are rejected (zip slip).
 //!   Characters Windows forbids become `_`; reserved names (CON, NUL...) get a `_` prefix.
-//! - **Existing files are never overwritten**: name clashes are skipped and counted.
+//! - **Existing files are skipped by default**. When overwriting is enabled, a file is replaced
+//!   only after its whole copy is written; a cancelled or broken entry leaves the original alone.
+//! - Links in the destination path are never followed (a small TOCTOU window remains: the check
+//!   and the write are separate calls, as with any plain file-system API).
 //! - Symlinks, hard links and device files are skipped.
 //! - Cancellable at any time; already extracted files are kept (as in Explorer) and the caller
 //!   reports them.
@@ -22,7 +25,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(windows)]
 mod bsdtar;
@@ -412,10 +415,14 @@ pub struct ExtractSummary {
     pub files: u64,
     /// Folder entries created (or already present).
     pub dirs: u64,
-    /// Skipped because the destination already had that name (no overwrite).
+    /// Name clashes left alone, including files that could not be replaced.
     pub skipped_existing: u64,
     /// Skipped as unsafe path or unsupported type (links etc.).
     pub skipped_unsafe: u64,
+    /// Existing files replaced by a newer copy when overwriting was enabled.
+    pub overwritten: u64,
+    /// The reader can't check for a password before writing, so overwriting was turned off.
+    pub overwrite_skipped: bool,
     /// Stopped by `cancel`; files extracted before that are kept.
     pub cancelled: bool,
 }
@@ -430,6 +437,8 @@ pub struct ExtractOptions<'a> {
     pub decode_legacy: &'a (dyn Fn(&[u8]) -> String + Sync),
     /// For a password-protected zip or 7z (#346); `None` until the user gives one.
     pub password: Option<&'a str>,
+    /// Replace existing files instead of skipping them.
+    pub overwrite: bool,
 }
 
 /// Extracts into `dest`, creating it if needed.
@@ -1064,6 +1073,21 @@ fn sanitize_component(part: &str) -> String {
     s
 }
 
+/// Resolves a validated relative name under `dest`. A link in any component below `dest` would
+/// send the write outside the folder; `dest` itself may be a link the user chose.
+pub(super) fn safe_target(dest: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut target = dest.to_path_buf();
+    for part in rel.components() {
+        target.push(part.as_os_str());
+        if let Ok(meta) = fs::symlink_metadata(&target)
+            && meta.file_type().is_symlink()
+        {
+            return None;
+        }
+    }
+    Some(target)
+}
+
 fn cancelled(opts: &ExtractOptions<'_>) -> bool {
     opts.cancel.load(Ordering::Relaxed)
 }
@@ -1074,6 +1098,8 @@ pub(super) enum Written {
     Done,
     /// Something by that name was there already; it is left alone.
     Exists,
+    /// An existing file was replaced with the copy from the archive.
+    Overwritten,
     /// The job was cancelled partway; the part written is gone again.
     Cancelled,
 }
@@ -1084,13 +1110,53 @@ impl Written {
         match self {
             Self::Done => summary.files += 1,
             Self::Exists => summary.skipped_existing += 1,
+            Self::Overwritten => {
+                summary.files += 1;
+                summary.overwritten += 1;
+            }
             Self::Cancelled => {}
         }
     }
 }
 
-/// Writes a file, skipping it if the destination exists. `expected`: the entry's size, when the
-/// archive states it reliably; fewer bytes means it broke off.
+/// Opens a fresh, uniquely named file next to `path` for an overwrite. The copy lives beside its
+/// target so the final rename never crosses volumes.
+fn temp_copy(path: &Path) -> Result<(File, PathBuf), ArchiveError> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let failed = |source| ArchiveError::Write {
+        path: path.to_path_buf(),
+        source,
+    };
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".arke-tmp-{}-{n}", std::process::id()));
+        match File::options().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(failed(source)),
+        }
+    }
+    Err(failed(io::ErrorKind::AlreadyExists.into()))
+}
+
+/// Removes an unfinished copy, including when a progress callback panics.
+struct RemoveOnDrop {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Writes a file, skipping it if the destination exists. With `overwrite`, an existing file is
+/// replaced atomically only after the whole entry is written; a cancelled or broken entry leaves
+/// the original untouched. `expected`: the entry's size, when the archive states it reliably.
 fn write_new_file(
     path: &Path,
     mut reader: impl Read,
@@ -1104,6 +1170,43 @@ fn write_new_file(
             source,
         })?;
     }
+    let replacing = if opts.overwrite {
+        match fs::symlink_metadata(path) {
+            // Directories, links and special files keep their name; only plain files are replaced.
+            Ok(meta) if !meta.is_file() => return Ok(Written::Exists),
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(ArchiveError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    } else {
+        false
+    };
+    if replacing {
+        let (file, tmp) = temp_copy(path)?;
+        let mut guard = RemoveOnDrop {
+            path: tmp.clone(),
+            armed: true,
+        };
+        let written = copy_entry(file, path, &mut reader, expected, on_bytes, opts, true);
+        return match written {
+            Ok(true) if cancelled(opts) => Ok(Written::Cancelled),
+            Ok(true) => match fs::rename(&tmp, path) {
+                Ok(()) => {
+                    guard.armed = false;
+                    Ok(Written::Overwritten)
+                }
+                // Read-only, locked, or otherwise unreplaceable: keep the user's file.
+                Err(_) => Ok(Written::Exists),
+            },
+            Ok(false) => Ok(Written::Cancelled),
+            Err(e) => Err(e),
+        };
+    }
     // create_new: atomic create-if-absent, never overwrites the user's file.
     let file = match File::options().write(true).create_new(true).open(path) {
         Ok(f) => f,
@@ -1115,11 +1218,11 @@ fn write_new_file(
             });
         }
     };
-    match copy_entry(file, path, &mut reader, expected, on_bytes, opts) {
+    let written = copy_entry(file, path, &mut reader, expected, on_bytes, opts, false);
+    match written {
         Ok(true) => Ok(Written::Done),
         // Cancelled partway, or the archive broke off (an old tar.exe stops at a RAR entry it
-        // can't decode): the half-written file would look like the real one, so it goes (#229).
-        // `create_new` above made it, so it was never the user's.
+        // can't decode): the half-written copy would look like the real one, so it goes (#229).
         Ok(false) => {
             let _ = fs::remove_file(path);
             Ok(Written::Cancelled)
@@ -1131,7 +1234,8 @@ fn write_new_file(
     }
 }
 
-/// Copies one entry into the new `file`. `Ok(false)`: cancelled before the end.
+/// Copies one entry into the new `file`. `Ok(false)`: cancelled before the end. `sync`: flush to
+/// disk before returning (only needed when this copy will replace a user's file).
 fn copy_entry(
     file: File,
     path: &Path,
@@ -1139,6 +1243,7 @@ fn copy_entry(
     expected: Option<u64>,
     on_bytes: &mut dyn FnMut(u64),
     opts: &ExtractOptions<'_>,
+    sync: bool,
 ) -> Result<bool, ArchiveError> {
     let mut out = BufWriter::new(file);
     let mut buf = vec![0u8; 256 * 1024];
@@ -1173,6 +1278,14 @@ fn copy_entry(
         path: path.to_path_buf(),
         source,
     })?;
+    // A replacement must reach the disk before the rename: otherwise a power cut can leave the
+    // user's file full of zeros (the same rule as `fs::replace_file`).
+    if sync {
+        out.get_ref().sync_all().map_err(|source| ArchiveError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
     Ok(true)
 }
 
@@ -1234,7 +1347,10 @@ fn extract_zip(
             summary.skipped_unsafe += 1;
             continue;
         }
-        let target = dest.join(&rel);
+        let Some(target) = safe_target(dest, &rel) else {
+            summary.skipped_unsafe += 1;
+            continue;
+        };
         if entry.is_dir() {
             fs::create_dir_all(&target).map_err(|source| ArchiveError::Create {
                 path: target.clone(),
@@ -1361,7 +1477,10 @@ fn extract_tar_with_counter(
             summary.skipped_unsafe += 1;
             continue;
         };
-        let target = dest.join(&rel);
+        let Some(target) = safe_target(dest, &rel) else {
+            summary.skipped_unsafe += 1;
+            continue;
+        };
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 fs::create_dir_all(&target).map_err(|source| ArchiveError::Create {
@@ -1464,6 +1583,7 @@ mod tests {
             progress,
             decode_legacy: &fake_big5,
             password: None,
+            overwrite: false,
         }
     }
 
@@ -1775,6 +1895,148 @@ mod tests {
             safe_relative_path(&[0xA4, 0xA4, b'.', b't', b'x', b't'], &fake_big5),
             Some(PathBuf::from("中.txt"))
         );
+    }
+
+    #[test]
+    fn overwrite_replaces_existing_file() {
+        let sb = Sandbox::new("overwrite");
+        let zip_path = sb.0.join("in.zip");
+        write_zip(&zip_path, &[(b"keep.txt", b"from zip"), (b"new.txt", b"new")]);
+        let dest = sb.0.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("keep.txt"), "user data").unwrap();
+        let cancel = AtomicBool::new(false);
+        let progress = |_: ExtractProgress| {};
+        let options = ExtractOptions {
+            overwrite: true,
+            ..opts(&cancel, &progress)
+        };
+        let summary = extract(&zip_path, &dest, ArchiveKind::Zip, &options).unwrap();
+        assert_eq!(
+            (summary.files, summary.overwritten, summary.skipped_existing),
+            (2, 1, 0)
+        );
+        assert_eq!(fs::read_to_string(dest.join("keep.txt")).unwrap(), "from zip");
+        assert_eq!(fs::read_to_string(dest.join("new.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn overwrite_cancellation_keeps_the_original() {
+        let sb = Sandbox::new("overwrite-cancel");
+        let tar_path = sb.0.join("big.tar");
+        {
+            let mut builder = tar::Builder::new(File::create(&tar_path).unwrap());
+            let body = vec![b'b'; 4 * 1024 * 1024];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "big.bin", &body[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let dest = sb.0.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("big.bin"), "user data").unwrap();
+        let cancel = AtomicBool::new(false);
+        let progress = |p: ExtractProgress| {
+            if p.done > 0 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let options = ExtractOptions {
+            overwrite: true,
+            ..opts(&cancel, &progress)
+        };
+        let summary = extract(&tar_path, &dest, ArchiveKind::Tar, &options).unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.files, 0);
+        assert_eq!(fs::read_to_string(dest.join("big.bin")).unwrap(), "user data");
+        assert!(fs::read_dir(&dest).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".arke-tmp-")));
+    }
+
+    #[test]
+    fn overwrite_broken_entry_keeps_the_original() {
+        let sb = Sandbox::new("overwrite-broken");
+        let tar_path = sb.0.join("cut.tar");
+        {
+            let mut builder = tar::Builder::new(File::create(&tar_path).unwrap());
+            let body = vec![b'w'; 200_000];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "cut.docx", &body[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let bytes = fs::read(&tar_path).unwrap();
+        fs::write(&tar_path, &bytes[..512 + 60_000]).unwrap();
+        let dest = sb.0.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("cut.docx"), "user data").unwrap();
+        let cancel = AtomicBool::new(false);
+        let progress = |_: ExtractProgress| {};
+        let options = ExtractOptions {
+            overwrite: true,
+            ..opts(&cancel, &progress)
+        };
+        let result = extract(&tar_path, &dest, ArchiveKind::Tar, &options);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(fs::read_to_string(dest.join("cut.docx")).unwrap(), "user data");
+        assert!(fs::read_dir(&dest).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".arke-tmp-")));
+    }
+
+    #[test]
+    fn overwrite_skips_a_directory_using_the_target_name() {
+        let sb = Sandbox::new("overwrite-dir");
+        let zip_path = sb.0.join("in.zip");
+        write_zip(&zip_path, &[(b"x.txt", b"new")]);
+        let dest = sb.0.join("dest");
+        fs::create_dir_all(dest.join("x.txt")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let progress = |_: ExtractProgress| {};
+        let options = ExtractOptions {
+            overwrite: true,
+            ..opts(&cancel, &progress)
+        };
+        let summary = extract(&zip_path, &dest, ArchiveKind::Zip, &options).unwrap();
+        assert_eq!(summary.skipped_existing, 1);
+        assert!(dest.join("x.txt").is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overwrite_never_follows_a_link_under_the_destination() {
+        let sb = Sandbox::new("overwrite-link");
+        let outside = sb.0.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let zip_path = sb.0.join("in.zip");
+        write_zip(&zip_path, &[(b"sub/evil.txt", b"bad")]);
+        let dest = sb.0.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        // Creating links needs privileges on some machines; the check itself is still covered by
+        // the directory case above when this isn't allowed.
+        if std::os::windows::fs::symlink_dir(&outside, dest.join("sub")).is_err() {
+            return;
+        }
+        let cancel = AtomicBool::new(false);
+        let progress = |_: ExtractProgress| {};
+        let options = ExtractOptions {
+            overwrite: true,
+            ..opts(&cancel, &progress)
+        };
+        let summary = extract(&zip_path, &dest, ArchiveKind::Zip, &options).unwrap();
+        assert_eq!(summary.skipped_unsafe, 1);
+        assert!(!outside.join("evil.txt").exists());
     }
 
     #[test]
